@@ -4,7 +4,7 @@ import argparse
 import json
 import mimetypes
 import os
-from typing import Dict, Tuple
+from typing import Dict, Tuple, List, Optional
 
 import tqdm
 import skimage.draw
@@ -13,9 +13,81 @@ import imageio
 import imageio.v2 as iio
 import imageio.plugins.ffmpeg
 import cv2
+# import torch
+from deepface import DeepFace
 
 from deface import __version__
 from deface.centerface import CenterFace
+
+# New imports
+from scipy.spatial.distance import cosine
+
+# Global variables for face tracking
+selected_face = None
+face_tracker = None
+
+def select_face(event, x, y, flags, param):
+    global selected_face
+    if event == cv2.EVENT_LBUTTONDOWN:
+        selected_face = (x, y)
+        print(f"Selected face at coordinates: ({x}, {y})")
+
+def init_face_selection(frame):
+    global selected_face
+    cv2.namedWindow("Select Face")
+    cv2.setMouseCallback("Select Face", select_face)
+    
+    while True:
+        cv2.imshow("Select Face", frame)
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord("q") or selected_face is not None:
+            break
+    
+    cv2.destroyAllWindows()
+    return selected_face
+
+def init_face_tracker(frame, bbox):
+    tracker = cv2.TrackerCSRT_create()
+    tracker.init(frame, bbox)
+    return tracker, bbox
+
+def update_face_tracker(frame, tracker, prev_bbox):
+    success, bbox = tracker.update(frame)
+    if success:
+        bbox = (bbox[0], bbox[1], bbox[0] + bbox[2], bbox[1] + bbox[3])
+        new_w, new_h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        prev_w, prev_h = prev_bbox[2] - prev_bbox[0], prev_bbox[3] - prev_bbox[1]
+        
+        max_change = 0.15
+        if abs(new_w - prev_w) / prev_w > max_change or abs(new_h - prev_h) / prev_h > max_change:
+            center_x, center_y = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
+            bbox = (
+                center_x - prev_w / 2,
+                center_y - prev_h / 2,
+                center_x + prev_w / 2,
+                center_y + prev_h / 2
+            )
+        return bbox
+    return None
+
+def get_face_embedding(face_image):
+    try:
+        result = DeepFace.represent(face_image, model_name="VGG-Face", enforce_detection=False)
+        return np.array(result[0]['embedding'])
+    except Exception as e:
+        print(f"Error getting face embedding: {str(e)}")
+        return None
+
+def is_same_face(face1, face2, threshold=0.6):
+    embedding1 = get_face_embedding(face1)
+    embedding2 = get_face_embedding(face2)
+    
+    if embedding1 is None or embedding2 is None:
+        return False
+    
+    cosine_similarity = 1 - cosine(embedding1, embedding2)
+    print(cosine_similarity)
+    return cosine_similarity > threshold
 
 
 def scale_bb(x1, y1, x2, y2, mask_scale=1.0):
@@ -119,6 +191,8 @@ def video_detect(
         keep_audio: bool = False,
         mosaicsize: int = 20,
 ):
+    global face_tracker, selected_face
+
     try:
         if 'fps' in ffmpeg_config:
             reader: imageio.plugins.ffmpeg.FfmpegFormat.Reader = imageio.get_reader(ipath, fps=ffmpeg_config['fps'])
@@ -140,6 +214,7 @@ def video_detect(
     else:
         read_iter = reader.iter_data()
         nframes = reader.count_frames()
+
     if nested:
         bar = tqdm.tqdm(dynamic_ncols=True, total=nframes, position=1, leave=True)
     else:
@@ -147,9 +222,7 @@ def video_detect(
 
     if opath is not None:
         _ffmpeg_config = ffmpeg_config.copy()
-        #  If fps is not explicitly set in ffmpeg_config, use source video fps value
         _ffmpeg_config.setdefault('fps', meta['fps'])
-        # Carry over audio from input path, use "copy" codec (no transcoding) by default
         if keep_audio and meta.get('audio_codec'):
             _ffmpeg_config.setdefault('audio_path', ipath)
             _ffmpeg_config.setdefault('audio_codec', 'copy')
@@ -157,9 +230,46 @@ def video_detect(
             opath, format='FFMPEG', mode='I', **_ffmpeg_config
         )
 
+    # Get the first frame for face selection
+    first_frame = next(read_iter)
+    selected_face = init_face_selection(first_frame)
+    
+    if selected_face is not None:
+        # Initialize the face tracker
+        initial_bbox = (selected_face[0]-50, selected_face[1]-50, 100, 100)  # (x, y, w, h) format
+        face_tracker, prev_bbox = init_face_tracker(cv2.cvtColor(first_frame, cv2.COLOR_RGB2BGR), initial_bbox)
+        selected_face_image = first_frame[initial_bbox[1]:initial_bbox[1]+initial_bbox[3], initial_bbox[0]:initial_bbox[0]+initial_bbox[2]]
+
     for frame in read_iter:
         # Perform network inference, get bb dets but discard landmark predictions
         dets, _ = centerface(frame, threshold=threshold)
+
+        if face_tracker is not None:
+            bgr_frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            tracked_bbox = update_face_tracker(bgr_frame, face_tracker, prev_bbox)
+            if tracked_bbox is not None:
+                x1, y1, x2, y2 = map(int, tracked_bbox)
+                # Keep detections that are within the tracked region
+                dets_in_tracked = [det for det in dets if x1 < det[0] < x2 and y1 < det[1] < y2]
+
+                # If there are exactly two detections in the tracked region, blur them
+                if len(dets_in_tracked) < 2:
+                    dets = [det for det in dets if not (x1 < det[0] < x2 and y1 < det[1] < y2)]
+
+                # Draw a green box around the tracked face
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    
+                prev_bbox = tracked_bbox
+            else:
+                # Tracker lost the face, try to find it again
+                print("Face tracking lost, attempting to recover...")
+                for det in dets:
+                    x1, y1, x2, y2 = map(int, det[:4])
+                    face_image = frame[y1:y2, x1:x2]
+                    if is_same_face(face_image, selected_face_image):
+                        face_tracker, prev_bbox = init_face_tracker(bgr_frame, (x1, y1, x2-x1, y2-y1))
+                        dets = [d for d in dets if not np.array_equal(d, det)]
+                        break
 
         anonymize_frame(
             dets, frame, mask_scale=mask_scale,
@@ -171,11 +281,12 @@ def video_detect(
             writer.append_data(frame)
 
         if enable_preview:
-            cv2.imshow('Preview of anonymization results (quit by pressing Q or Escape)', frame[:, :, ::-1])  # RGB -> RGB
+            cv2.imshow('Preview of anonymization results (quit by pressing Q or Escape)', frame[:, :, ::-1])  # RGB -> BGR
             if cv2.waitKey(1) & 0xFF in [ord('q'), 27]:  # 27 is the escape key code
                 cv2.destroyAllWindows()
                 break
         bar.update()
+
     reader.close()
     if opath is not None:
         writer.close()
@@ -284,7 +395,7 @@ def parse_cli_args():
         '--preview', '-p', default=False, action='store_true',
         help='Enable live preview GUI (can decrease performance).')
     parser.add_argument(
-        '--boxes', default=False, action='store_true',
+        '--boxes', default=True, action='store_true',
         help='Use boxes instead of ellipse masks.')
     parser.add_argument(
         '--draw-scores', default=False, action='store_true',
