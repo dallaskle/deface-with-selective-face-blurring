@@ -14,3 +14,10 @@ The CLI usage remains the same as the original Deface repository. For details on
 `python deface/main.py /path/to/lecture.mp4`
 
 In this modified version, a face is selected at the start of the video for exclusion from the blurring process.
+
+## Other Experiments
+- Tested [face_recognition](https://github.com/ageitgey/face_recognition), [EgoBlur](https://github.com/facebookresearch/EgoBlur/tree/main), OpenCV Multi-Object Tracking API and Youtube Studio (in-built blur) to blur student faces. All fell short of providing a high accuracy consistent blur.
+
+
+## Credit
+Project idea from [Divide-By-0](https://github.com/Divide-By-0/) and [MIT SOUL](http://soul.mit.edu/)
