@@ -13,6 +13,7 @@ import imageio
 import imageio.v2 as iio
 import imageio.plugins.ffmpeg
 import cv2
+import glob
 # import torch
 from deepface import DeepFace
 
@@ -22,9 +23,20 @@ from deface.centerface import CenterFace
 # New imports
 from scipy.spatial.distance import cosine
 
+from shapely.geometry import box
+
 # Global variables for face tracking
 selected_face = None
 face_tracker = None
+
+
+# Add this function to calculate IoU
+def calculate_iou(box1, box2):
+    b1 = box(*box1)
+    b2 = box(*box2)
+    intersection = b1.intersection(b2).area
+    union = b1.union(b2).area
+    return intersection / union if union > 0 else 0
 
 def select_face(event, x, y, flags, param):
     global selected_face
@@ -47,9 +59,25 @@ def init_face_selection(frame):
     return selected_face
 
 def init_face_tracker(frame, bbox):
+    x, y, w, h = bbox
+    center_x = x + w / 2
+    center_y = y + h / 2
+    new_w = w * 2  # Double the width
+    new_h = h * 1.5  # 1.5 times taller
+    new_x = center_x - new_w / 2  # Adjust x to keep the same center
+    new_y = center_y - new_h / 2  # Adjust y to keep the same center
+    
+    # Ensure the new bounding box stays within the frame
+    new_x = max(0, new_x)
+    new_y = max(0, new_y)
+    new_w = min(new_w, frame.shape[1] - new_x)
+    new_h = min(new_h, frame.shape[0] - new_y)
+    
+    new_bbox = (int(new_x), int(new_y), int(new_w), int(new_h))
+    
     tracker = cv2.TrackerCSRT_create()
-    tracker.init(frame, bbox)
-    return tracker, bbox
+    tracker.init(frame, new_bbox)
+    return tracker, new_bbox
 
 def update_face_tracker(frame, tracker, prev_bbox):
     success, bbox = tracker.update(frame)
@@ -59,14 +87,24 @@ def update_face_tracker(frame, tracker, prev_bbox):
         prev_w, prev_h = prev_bbox[2] - prev_bbox[0], prev_bbox[3] - prev_bbox[1]
         
         max_change = 0.15
-        if abs(new_w - prev_w) / prev_w > max_change or abs(new_h - prev_h) / prev_h > max_change:
-            center_x, center_y = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
-            bbox = (
-                center_x - prev_w / 2,
-                center_y - prev_h / 2,
-                center_x + prev_w / 2,
-                center_y + prev_h / 2
-            )
+        
+        # Check if prev_w or prev_h is zero to avoid division by zero
+        if prev_w > 0 and prev_h > 0:
+            w_change = abs(new_w - prev_w) / prev_w
+            h_change = abs(new_h - prev_h) / prev_h
+            
+            if w_change > max_change or h_change > max_change:
+                center_x, center_y = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
+                bbox = (
+                    center_x - prev_w / 2,
+                    center_y - prev_h / 2,
+                    center_x + prev_w / 2,
+                    center_y + prev_h / 2
+                )
+        else:
+            # If prev_w or prev_h is zero, use the new bbox as is
+            pass
+
         return bbox
     return None
 
@@ -78,17 +116,67 @@ def get_face_embedding(face_image):
         print(f"Error getting face embedding: {str(e)}")
         return None
 
-def is_same_face(face1, face2, threshold=0.6):
-    embedding1 = get_face_embedding(face1)
-    embedding2 = get_face_embedding(face2)
+def get_face_embeddings(image_directory):
+    embeddings = []
+    for image_path in glob.glob(os.path.join(image_directory, '*')):
+        image = cv2.imread(image_path)
+        if image is not None:
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            embedding = get_face_embedding(image)
+            if embedding is not None:
+                embeddings.append(embedding)
+    return embeddings
+
+def is_same_person(face, target_embeddings, threshold=0.2):
+    face_embedding = get_face_embedding(face)
     
-    if embedding1 is None or embedding2 is None:
+    if face_embedding is None:
         return False
     
-    cosine_similarity = 1 - cosine(embedding1, embedding2)
-    print(cosine_similarity)
-    return cosine_similarity > threshold
+    if not target_embeddings:
+        return False
+    
+    total_similarity = 0
+    for target_embedding in target_embeddings:
+        cosine_similarity = 1 - cosine(face_embedding, target_embedding)
+        total_similarity += cosine_similarity
+    
+    average_similarity = total_similarity / len(target_embeddings)
+    
+    return average_similarity > threshold
 
+def find_person_in_frame(frame, target_embeddings, centerface, threshold):
+    dets, _ = centerface(frame, threshold=threshold)
+    
+    for det in dets:
+        x1, y1, x2, y2 = map(int, det[:4])
+        face_image = frame[y1:y2, x1:x2]
+        if is_same_person(face_image, target_embeddings):
+            return (x1, y1, x2-x1, y2-y1)  # Return as (x, y, w, h)
+    
+    return None
+
+def detect_scene_change(prev_frame, curr_frame, threshold=0.1):
+    if prev_frame is None or curr_frame is None:
+        return False
+    
+    # Convert frames to grayscale
+    prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_RGB2GRAY)
+    curr_gray = cv2.cvtColor(curr_frame, cv2.COLOR_RGB2GRAY)
+    
+    # Compute histograms
+    prev_hist = cv2.calcHist([prev_gray], [0], None, [256], [0, 256])
+    curr_hist = cv2.calcHist([curr_gray], [0], None, [256], [0, 256])
+    
+    # Normalize histograms
+    prev_hist = cv2.normalize(prev_hist, prev_hist).flatten()
+    curr_hist = cv2.normalize(curr_hist, curr_hist).flatten()
+    
+    # Compare histograms
+    hist_diff = cv2.compareHist(prev_hist, curr_hist, cv2.HISTCMP_BHATTACHARYYA)
+    # print(hist_diff)
+    
+    return hist_diff > threshold
 
 def scale_bb(x1, y1, x2, y2, mask_scale=1.0):
     s = mask_scale - 1.0
@@ -190,8 +278,9 @@ def video_detect(
         replaceimg = None,
         keep_audio: bool = False,
         mosaicsize: int = 20,
+        target_embeddings = None,
 ):
-    global face_tracker, selected_face
+    global face_tracker
 
     try:
         if 'fps' in ffmpeg_config:
@@ -230,46 +319,81 @@ def video_detect(
             opath, format='FFMPEG', mode='I', **_ffmpeg_config
         )
 
-    # Get the first frame for face selection
-    first_frame = next(read_iter)
-    selected_face = init_face_selection(first_frame)
-    
-    if selected_face is not None:
-        # Initialize the face tracker
-        initial_bbox = (selected_face[0]-50, selected_face[1]-50, 100, 100)  # (x, y, w, h) format
-        face_tracker, prev_bbox = init_face_tracker(cv2.cvtColor(first_frame, cv2.COLOR_RGB2BGR), initial_bbox)
-        selected_face_image = first_frame[initial_bbox[1]:initial_bbox[1]+initial_bbox[3], initial_bbox[0]:initial_bbox[0]+initial_bbox[2]]
+    face_tracker = None
+    target_person_found = False
+    iou_threshold = 0.2
+    prev_frame = None
+    scene_change_threshold = 0.2
 
     for frame in read_iter:
+
+        # Ensure frame is in the correct format (numpy array)
+        if isinstance(frame, np.ndarray):
+            current_frame = frame
+        else:
+            current_frame = np.array(frame)
+
+        if prev_frame is not None:
+            if detect_scene_change(prev_frame, current_frame, scene_change_threshold):
+                print("Scene change detected. Reinitializing face tracking.")
+                face_tracker = None
+                target_person_found = False
+
+        if not target_person_found:
+            person_bbox = find_person_in_frame(frame, target_embeddings, centerface, threshold)
+            if person_bbox is not None:
+                # face_tracker = cv2.TrackerCSRT_create()
+                # face_tracker.init(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR), person_bbox)
+                face_tracker, prev_bbox = init_face_tracker(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR), person_bbox)
+                target_person_found = True
+                print("Target person found and tracking started.")
+
         # Perform network inference, get bb dets but discard landmark predictions
         dets, _ = centerface(frame, threshold=threshold)
+        flag = True
 
         if face_tracker is not None:
             bgr_frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
             tracked_bbox = update_face_tracker(bgr_frame, face_tracker, prev_bbox)
             if tracked_bbox is not None:
+                flag = True
                 x1, y1, x2, y2 = map(int, tracked_bbox)
+                # x2, y2 = x1 + w, y1 + h
+                # tracked_box = (x1, y1, x2, y2)
+                
+                # Calculate IoU for each detection with the tracked box
+                ious = [calculate_iou(tracked_bbox, (det[0], det[1], det[2], det[3])) for det in dets]
+                
                 # Keep detections that are within the tracked region
-                dets_in_tracked = [det for det in dets if x1 < det[0] < x2 and y1 < det[1] < y2]
+                # dets_in_tracked = [det for det in dets if x1 < det[0] < x2 and y1 < det[1] < y2]
+                dets_in_tracked = [det for det, iou in zip(dets, ious) if iou > iou_threshold]
 
                 # If there are exactly two detections in the tracked region, blur them
                 if len(dets_in_tracked) < 2:
-                    dets = [det for det in dets if not (x1 < det[0] < x2 and y1 < det[1] < y2)]
+                    # dets = [det for det in dets if not (x1 < det[0] < x2 and y1 < det[1] < y2)]
+                   dets = [det for det, iou in zip(dets, ious) if iou < iou_threshold]
 
                 # Draw a green box around the tracked face
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                    
+
+                # Draw a red rectangle around the whole frame
+                height, width = frame.shape[:2]
+                cv2.rectangle(frame, (0, 0), (width - 1, height - 1), (255, 0, 0), 2)
+                
                 prev_bbox = tracked_bbox
             else:
                 # Tracker lost the face, try to find it again
-                print("Face tracking lost, attempting to recover...")
+                if flag==True:
+                    flag=False
+                    # print("Face tracking lost, attempting to recover...")
                 for det in dets:
                     x1, y1, x2, y2 = map(int, det[:4])
                     face_image = frame[y1:y2, x1:x2]
-                    if is_same_face(face_image, selected_face_image):
+                    if is_same_person(face_image, target_embeddings):
                         face_tracker, prev_bbox = init_face_tracker(bgr_frame, (x1, y1, x2-x1, y2-y1))
                         dets = [d for d in dets if not np.array_equal(d, det)]
                         break
+
 
         anonymize_frame(
             dets, frame, mask_scale=mask_scale,
@@ -285,6 +409,8 @@ def video_detect(
             if cv2.waitKey(1) & 0xFF in [ord('q'), 27]:  # 27 is the escape key code
                 cv2.destroyAllWindows()
                 break
+
+        prev_frame = current_frame.copy()
         bar.update()
 
     reader.close()
@@ -385,8 +511,16 @@ def parse_cli_args():
     parser.add_argument(
         '--output', '-o', default=None, metavar='O',
         help='Output file name. Defaults to input path + postfix "_anonymized".')
+    # parser.add_argument(
+    #     '--target-person', required=True,
+    #     help='Path to the image of the target person to be tracked.'
+    # )
     parser.add_argument(
-        '--thresh', '-t', default=0.2, type=float, metavar='T',
+        '--target-person-dir', required=True,
+        help='Path to the directory containing images of the target person to be tracked.'
+    )
+    parser.add_argument(
+        '--thresh', '-t', default=0.3, type=float, metavar='T',
         help='Detection threshold (tune this to trade off between false positive and false negative rate). Default: 0.2.')
     parser.add_argument(
         '--scale', '-s', default=None, metavar='WxH',
@@ -461,7 +595,17 @@ def main():
             # or an invalid path. The latter two cases are handled below.
             ipaths.append(path)
 
-    
+    # target_person_image = cv2.imread(args.target_person)
+    # if target_person_image is None:
+    #     print(f"Error: Could not load target person image from {args.target_person}")
+    #     exit(1)
+    # target_person_image = cv2.cvtColor(target_person_image, cv2.COLOR_BGR2RGB)
+
+    target_embeddings = get_face_embeddings(args.target_person_dir)
+    if not target_embeddings:
+        print(f"Error: Could not load any valid target person images from {args.target_person_dir}")
+        exit(1)
+
     base_opath = args.output
     replacewith = args.replacewith
     enable_preview = args.preview
@@ -521,7 +665,9 @@ def main():
                 keep_audio=keep_audio,
                 ffmpeg_config=ffmpeg_config,
                 replaceimg=replaceimg,
-                mosaicsize=mosaicsize
+                mosaicsize=mosaicsize,
+                # target_person_image=target_person_image,
+                target_embeddings=target_embeddings,
             )
         elif filetype == 'image':
             image_detect(
