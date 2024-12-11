@@ -12,9 +12,9 @@ import numpy as np
 import imageio
 import imageio.v2 as iio
 import imageio.plugins.ffmpeg
+from PIL import Image
 import cv2
 import glob
-# import torch
 from deepface import DeepFace
 
 from deface import __version__
@@ -29,14 +29,85 @@ from shapely.geometry import box
 selected_face = None
 face_tracker = None
 
+# Add new function for image preprocessing
+def preprocess_image(image):
+    """
+    Preprocess image to improve quality for face recognition.
+    """
+    # Convert to PIL Image if needed
+    if isinstance(image, np.ndarray):
+        image = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+    
+    # Upscale image using Lanczos resampling
+    target_size = (512, 512)  # Reasonable size for face recognition
+    image = image.resize(target_size, Image.Resampling.LANCZOS)
+    
+    # Convert back to numpy array
+    image = np.array(image)
+    
+    # Denoise
+    image = cv2.fastNlMeansDenoisingColored(image, None, 10, 10, 7, 21)
+    
+    return image
 
+def init_centerface(in_shape, backend, execution_provider):
+    """Initialize CenterFace with fallback options if the preferred backend fails"""
+    try:
+        # First try with specified settings
+        return CenterFace(
+            in_shape=in_shape,
+            backend=backend,
+            override_execution_provider=execution_provider
+        )
+    except Exception as e:
+        print(f"Warning: Failed to initialize with specified backend ({backend}): {str(e)}")
+        
+        try:
+            # Fallback to OpenCV backend
+            print("Attempting to fallback to OpenCV backend...")
+            return CenterFace(
+                in_shape=in_shape,
+                backend='opencv'
+            )
+        except Exception as e2:
+            print(f"Error: Failed to initialize CenterFace with fallback backend: {str(e2)}")
+            raise
+        
 # Add this function to calculate IoU
 def calculate_iou(box1, box2):
-    b1 = box(*box1)
-    b2 = box(*box2)
-    intersection = b1.intersection(b2).area
-    union = b1.union(b2).area
-    return intersection / union if union > 0 else 0
+    """
+    Calculate intersection over union between two boxes.
+    Box format should be (x1, y1, x2, y2) or (x, y, w, h)
+    """
+    # Convert box1 from (x, y, w, h) to (x1, y1, x2, y2) if needed
+    if len(box1) == 4:
+        if isinstance(box1[2], float) and box1[2] < box1[0]:  # Already in x1,y1,x2,y2 format
+            x1_1, y1_1, x2_1, y2_1 = box1
+        else:  # x,y,w,h format
+            x1_1, y1_1, w_1, h_1 = box1
+            x2_1, y2_1 = x1_1 + w_1, y1_1 + h_1
+    
+    # Convert box2 from (x, y, w, h) to (x1, y1, x2, y2) if needed
+    if len(box2) == 4:
+        if isinstance(box2[2], float) and box2[2] < box2[0]:  # Already in x1,y1,x2,y2 format
+            x1_2, y1_2, x2_2, y2_2 = box2
+        else:  # x,y,w,h format
+            x1_2, y1_2, w_2, h_2 = box2
+            x2_2, y2_2 = x1_2 + w_2, y1_2 + h_2
+
+    # Calculate intersection coordinates
+    x1_i = max(x1_1, x1_2)
+    y1_i = max(y1_1, y1_2)
+    x2_i = min(x2_1, x2_2)
+    y2_i = min(y2_1, y2_2)
+
+    # Calculate areas
+    intersection_area = max(0, x2_i - x1_i) * max(0, y2_i - y1_i)
+    box1_area = (x2_1 - x1_1) * (y2_1 - y1_1)
+    box2_area = (x2_2 - x1_2) * (y2_2 - y1_2)
+    union_area = box1_area + box2_area - intersection_area
+
+    return intersection_area / union_area if union_area > 0 else 0.0
 
 def select_face(event, x, y, flags, param):
     global selected_face
@@ -62,8 +133,8 @@ def init_face_tracker(frame, bbox):
     x, y, w, h = bbox
     center_x = x + w / 2
     center_y = y + h / 2
-    new_w = w * 2  # Double the width
-    new_h = h * 1.5  # 1.5 times taller
+    new_w = w * 2.5  # Double the width
+    new_h = h * 2.5  # 1.5 times taller
     new_x = center_x - new_w / 2  # Adjust x to keep the same center
     new_y = center_y - new_h / 2  # Adjust y to keep the same center
     
@@ -110,7 +181,7 @@ def update_face_tracker(frame, tracker, prev_bbox):
 
 def get_face_embedding(face_image):
     try:
-        result = DeepFace.represent(face_image, model_name="VGG-Face", enforce_detection=False)
+        result = DeepFace.represent(face_image, model_name="Facenet512", enforce_detection=False)
         return np.array(result[0]['embedding'])
     except Exception as e:
         print(f"Error getting face embedding: {str(e)}")
@@ -118,16 +189,35 @@ def get_face_embedding(face_image):
 
 def get_face_embeddings(image_directory):
     embeddings = []
+    processed_dir = os.path.join(image_directory, 'processed')
+    os.makedirs(processed_dir, exist_ok=True)
+    
     for image_path in glob.glob(os.path.join(image_directory, '*')):
+        # Skip the processed directory itself
+        if image_path == processed_dir:
+            continue
+            
+        # Skip non-image files
+        if not any(image_path.lower().endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.bmp']):
+            continue
+        
         image = cv2.imread(image_path)
         if image is not None:
-            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            embedding = get_face_embedding(image)
+            # Preprocess the image
+            processed_image = preprocess_image(image)
+            
+            # Save processed image
+            processed_path = os.path.join(processed_dir, f'processed_{os.path.basename(image_path)}')
+            cv2.imwrite(processed_path, cv2.cvtColor(processed_image, cv2.COLOR_RGB2BGR))
+            
+            # Get embedding from processed image
+            embedding = get_face_embedding(processed_image)
             if embedding is not None:
                 embeddings.append(embedding)
+    
     return embeddings
 
-def is_same_person(face, target_embeddings, threshold=0.2):
+def is_same_person(face, target_embeddings, threshold=0.4):
     face_embedding = get_face_embedding(face)
     
     if face_embedding is None:
@@ -145,8 +235,8 @@ def is_same_person(face, target_embeddings, threshold=0.2):
     
     return average_similarity > threshold
 
-def find_person_in_frame(frame, target_embeddings, centerface, threshold):
-    dets, _ = centerface(frame, threshold=threshold)
+def find_person_in_frame(frame, target_embeddings, centerface, threshold, dets):
+    # dets, _ = centerface(frame, threshold=threshold)
     
     for det in dets:
         x1, y1, x2, y2 = map(int, det[:4])
@@ -195,24 +285,30 @@ def draw_det(
         draw_scores: bool = False,
         ovcolor: Tuple[int] = (0, 0, 0),
         replaceimg = None,
-        mosaicsize: int = 20
+        mosaicsize: int = 20,
+        debugging: bool = False  # Add debugging parameter
 ):
     if replacewith == 'solid':
         cv2.rectangle(frame, (x1, y1), (x2, y2), ovcolor, -1)
     elif replacewith == 'blur':
-        bf = 2  # blur factor (number of pixels in each dimension that the face will be reduced to)
-        blurred_box =  cv2.blur(
+        bf = 2  # blur factor
+        blurred_box = cv2.blur(
             frame[y1:y2, x1:x2],
             (abs(x2 - x1) // bf, abs(y2 - y1) // bf)
         )
         if ellipse:
             roibox = frame[y1:y2, x1:x2]
-            # Get y and x coordinate lists of the "bounding ellipse"
             ey, ex = skimage.draw.ellipse((y2 - y1) // 2, (x2 - x1) // 2, (y2 - y1) // 2, (x2 - x1) // 2)
             roibox[ey, ex] = blurred_box[ey, ex]
             frame[y1:y2, x1:x2] = roibox
         else:
             frame[y1:y2, x1:x2] = blurred_box
+            
+        # Add colored box around blurred faces when debugging
+        if debugging:
+            # Draw a blue box around blurred faces
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
+
     elif replacewith == 'img':
         target_size = (x2 - x1, y2 - y1)
         resized_replaceimg = cv2.resize(replaceimg, target_size)
@@ -238,7 +334,8 @@ def draw_det(
 
 def anonymize_frame(
         dets, frame, mask_scale,
-        replacewith, ellipse, draw_scores, replaceimg, mosaicsize
+        replacewith, ellipse, draw_scores, replaceimg, mosaicsize,
+        debugging: bool = False  # Add debugging parameter
 ):
     for i, det in enumerate(dets):
         boxes, score = det[:4], det[4]
@@ -253,7 +350,8 @@ def anonymize_frame(
             ellipse=ellipse,
             draw_scores=draw_scores,
             replaceimg=replaceimg,
-            mosaicsize=mosaicsize
+            mosaicsize=mosaicsize,
+            debugging=debugging
         )
 
 
@@ -279,6 +377,7 @@ def video_detect(
         keep_audio: bool = False,
         mosaicsize: int = 20,
         target_embeddings = None,
+        debugging: bool = False,  # Add debugging parameter
 ):
     global face_tracker
 
@@ -327,30 +426,30 @@ def video_detect(
 
     for frame in read_iter:
 
+        # Perform network inference, get bb dets but discard landmark predictions
+        dets, _ = centerface(frame, threshold=threshold)
+        flag = True
+
         # Ensure frame is in the correct format (numpy array)
         if isinstance(frame, np.ndarray):
             current_frame = frame
         else:
             current_frame = np.array(frame)
 
-        if prev_frame is not None:
+        if prev_frame is not None and target_person_found:
             if detect_scene_change(prev_frame, current_frame, scene_change_threshold):
-                print("Scene change detected. Reinitializing face tracking.")
+                if debugging:  # Add debug message for scene change
+                    print("Scene change detected. Reinitializing face tracking.")
                 face_tracker = None
                 target_person_found = False
 
         if not target_person_found:
-            person_bbox = find_person_in_frame(frame, target_embeddings, centerface, threshold)
+            person_bbox = find_person_in_frame(frame, target_embeddings, centerface, threshold, dets)
             if person_bbox is not None:
-                # face_tracker = cv2.TrackerCSRT_create()
-                # face_tracker.init(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR), person_bbox)
                 face_tracker, prev_bbox = init_face_tracker(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR), person_bbox)
                 target_person_found = True
-                print("Target person found and tracking started.")
-
-        # Perform network inference, get bb dets but discard landmark predictions
-        dets, _ = centerface(frame, threshold=threshold)
-        flag = True
+                if debugging:  # Add debug message for target person detection
+                    print("Target person found and tracking started.")
 
         if face_tracker is not None:
             bgr_frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
@@ -358,34 +457,37 @@ def video_detect(
             if tracked_bbox is not None:
                 flag = True
                 x1, y1, x2, y2 = map(int, tracked_bbox)
-                # x2, y2 = x1 + w, y1 + h
-                # tracked_box = (x1, y1, x2, y2)
                 
                 # Calculate IoU for each detection with the tracked box
                 ious = [calculate_iou(tracked_bbox, (det[0], det[1], det[2], det[3])) for det in dets]
                 
-                # Keep detections that are within the tracked region
-                # dets_in_tracked = [det for det in dets if x1 < det[0] < x2 and y1 < det[1] < y2]
-                dets_in_tracked = [det for det, iou in zip(dets, ious) if iou > iou_threshold]
+                dets_in_tracked = [
+                    det for det, iou in zip(dets, ious)
+                    if (x1 < det[0] < x2 and y1 < det[1] < y2) or iou > iou_threshold
+                ]
 
-                # If there are exactly two detections in the tracked region, blur them
-                if len(dets_in_tracked) < 2:
-                    # dets = [det for det in dets if not (x1 < det[0] < x2 and y1 < det[1] < y2)]
-                   dets = [det for det, iou in zip(dets, ious) if iou < iou_threshold]
+                if len(dets_in_tracked) == 0:
+                    if debugging:
+                        print("No faces found in tracking region, resetting tracker")
+                    face_tracker = None
+                    target_person_found = False
 
-                # Draw a green box around the tracked face
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                # # if len(dets_in_tracked) < 2:
+                # dets = [
+                #     det for det, iou in zip(dets, ious)
+                #     if not ((x1 < det[0] < x2 and y1 < det[1] < y2) or iou > iou_threshold)
+                # ]
 
-                # Draw a red rectangle around the whole frame
-                height, width = frame.shape[:2]
-                cv2.rectangle(frame, (0, 0), (width - 1, height - 1), (255, 0, 0), 2)
+                # Only draw boxes if debugging is enabled
+                if debugging:
+                    # Draw a green box around the tracked face
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
                 
                 prev_bbox = tracked_bbox
             else:
-                # Tracker lost the face, try to find it again
-                if flag==True:
+                if flag==True and debugging:
                     flag=False
-                    # print("Face tracking lost, attempting to recover...")
+                    print("Face tracking lost, attempting to recover...")
                 for det in dets:
                     x1, y1, x2, y2 = map(int, det[:4])
                     face_image = frame[y1:y2, x1:x2]
@@ -398,7 +500,7 @@ def video_detect(
         anonymize_frame(
             dets, frame, mask_scale=mask_scale,
             replacewith=replacewith, ellipse=ellipse, draw_scores=draw_scores,
-            replaceimg=replaceimg, mosaicsize=mosaicsize
+            replaceimg=replaceimg, mosaicsize=mosaicsize, debugging=debugging
         )
 
         if opath is not None:
@@ -506,21 +608,27 @@ def get_anonymized_image(frame,
 def parse_cli_args():
     parser = argparse.ArgumentParser(description='Video anonymization by face detection', add_help=False)
     parser.add_argument(
-        'input', nargs='*',
-        help=f'File path(s) or camera device name. It is possible to pass multiple paths by separating them by spaces or by using shell expansion (e.g. `$ deface vids/*.mp4`). Alternatively, you can pass a directory as an input, in which case all files in the directory will be used as inputs. If a camera is installed, a live webcam demo can be started by running `$ deface cam` (which is a shortcut for `$ deface -p \'<video0>\'`.')
+        'input_dir',
+        help='Directory containing video folders. Each video folder should contain a video file and a target_person directory.'
+    )
     parser.add_argument(
         '--output', '-o', default=None, metavar='O',
         help='Output file name. Defaults to input path + postfix "_anonymized".')
-    # parser.add_argument(
-    #     '--target-person', required=True,
-    #     help='Path to the image of the target person to be tracked.'
-    # )
     parser.add_argument(
-        '--target-person-dir', required=True,
-        help='Path to the directory containing images of the target person to be tracked.'
+        '--video-filename', default='video.mp4',
+        help='Name of the video file in each video folder. Default: video.mp4'
     )
     parser.add_argument(
-        '--thresh', '-t', default=0.3, type=float, metavar='T',
+        '--target-person-dirname', default='target_person',
+        help='Name of the target person directory in each video folder. Default: target_person'
+    )
+    parser.add_argument(
+        '--debugging', default=False, action='store_true',
+        help='Enable debug mode with additional console output and visualization.'
+    )
+
+    parser.add_argument(
+        '--thresh', '-t', default=0.2, type=float, metavar='T',
         help='Detection threshold (tune this to trade off between false positive and false negative rate). Default: 0.2.')
     parser.add_argument(
         '--scale', '-s', default=None, metavar='WxH',
@@ -569,44 +677,22 @@ def parse_cli_args():
 
     args = parser.parse_args()
 
-    if len(args.input) == 0:
-        parser.print_help()
-        print('\nPlease supply at least one input path.')
-        exit(1)
+    # if len(args.input) == 0:
+    #     parser.print_help()
+    #     print('\nPlease supply at least one input path.')
+    #     exit(1)
 
-    if args.input == ['cam']:  # Shortcut for webcam demo with live preview
-        args.input = ['<video0>']
-        args.preview = True
+    # if args.input == ['cam']:  # Shortcut for webcam demo with live preview
+    #     args.input = ['<video0>']
+    #     args.preview = True
 
     return args
 
 
 def main():
     args = parse_cli_args()
-    ipaths = []
-
-    # add files in folders
-    for path in args.input:
-        if os.path.isdir(path):
-            for file in os.listdir(path):
-                ipaths.append(os.path.join(path,file))
-        else:
-            # Either a path to a regular file, the special 'cam' shortcut
-            # or an invalid path. The latter two cases are handled below.
-            ipaths.append(path)
-
-    # target_person_image = cv2.imread(args.target_person)
-    # if target_person_image is None:
-    #     print(f"Error: Could not load target person image from {args.target_person}")
-    #     exit(1)
-    # target_person_image = cv2.cvtColor(target_person_image, cv2.COLOR_BGR2RGB)
-
-    target_embeddings = get_face_embeddings(args.target_person_dir)
-    if not target_embeddings:
-        print(f"Error: Could not load any valid target person images from {args.target_person_dir}")
-        exit(1)
-
-    base_opath = args.output
+    
+    # Initialize variables
     replacewith = args.replacewith
     enable_preview = args.preview
     draw_scores = args.draw_scores
@@ -615,82 +701,123 @@ def main():
     mask_scale = args.mask_scale
     keep_audio = args.keep_audio
     ffmpeg_config = args.ffmpeg_config
-    backend = args.backend
-    in_shape = args.scale
-    execution_provider = args.execution_provider
     mosaicsize = args.mosaicsize
     keep_metadata = args.keep_metadata
     replaceimg = None
-    if in_shape is not None:
-        w, h = in_shape.split('x')
-        in_shape = int(w), int(h)
+
+    # Handle scale argument
+    if args.scale is not None:
+        try:
+            w, h = args.scale.split('x')
+            in_shape = (int(w), int(h))
+        except ValueError:
+            print(f"Error: Invalid scale format. Expected WxH (e.g., 640x360), got {args.scale}")
+            return
+    else:
+        in_shape = None
+
+    # Handle replace image if specified
     if replacewith == "img":
-        replaceimg = imageio.imread(args.replaceimg)
-        print(f'After opening {args.replaceimg} shape: {replaceimg.shape}')
+        try:
+            replaceimg = imageio.imread(args.replaceimg)
+            print(f'Loaded replacement image {args.replaceimg}, shape: {replaceimg.shape}')
+        except Exception as e:
+            print(f"Error loading replacement image: {str(e)}")
+            return
 
+    # Initialize CenterFace
+    try:
+        centerface = init_centerface(
+            in_shape=in_shape,
+            backend=args.backend,
+            execution_provider=args.execution_provider
+        )
+        print("Successfully initialized face detection model")
+    except Exception as e:
+        print(f"Fatal error: Could not initialize face detection model: {str(e)}")
+        return
 
-    # TODO: scalar downscaling setting (-> in_shape), preserving aspect ratio
-    centerface = CenterFace(in_shape=in_shape, backend=backend, override_execution_provider=execution_provider)
+    # Verify input directory exists
+    if not os.path.isdir(args.input_dir):
+        print(f"Error: Input directory '{args.input_dir}' does not exist")
+        return
 
-    multi_file = len(ipaths) > 1
-    if multi_file:
-        ipaths = tqdm.tqdm(ipaths, position=0, dynamic_ncols=True, desc='Batch progress')
+    # Get list of video folders
+    video_folders = [f for f in os.listdir(args.input_dir) 
+                    if os.path.isdir(os.path.join(args.input_dir, f))]
+    
+    if not video_folders:
+        print(f"No video folders found in {args.input_dir}")
+        return
 
-    for ipath in ipaths:
-        opath = base_opath
-        if ipath == 'cam':
-            ipath = '<video0>'
-            enable_preview = True
-        filetype = get_file_type(ipath)
-        is_cam = filetype == 'cam'
-        if opath is None and not is_cam:
-            root, ext = os.path.splitext(ipath)
-            opath = f'{root}_anonymized{ext}'
-        print(f'Input:  {ipath}\nOutput: {opath}')
-        if opath is None and not enable_preview:
-            print('No output file is specified and the preview GUI is disabled. No output will be produced.')
-        if filetype == 'video' or is_cam:
+    print(f"Found {len(video_folders)} video folders to process")
+    
+    # Process each video folder
+    for video_folder in tqdm.tqdm(video_folders, desc='Processing videos'):
+        try:
+            video_path = os.path.join(args.input_dir, video_folder, args.video_filename)
+            target_person_dir = os.path.join(args.input_dir, video_folder, args.target_person_dirname)
+            
+            # Verify required files exist
+            if not os.path.exists(video_path):
+                print(f"Warning: Video file not found in {video_folder}")
+                continue
+                
+            if not os.path.exists(target_person_dir):
+                print(f"Warning: Target person directory not found in {video_folder}")
+                continue
+            
+            # Generate output path
+            output_path = os.path.join(args.input_dir, video_folder, f"anonymized_{args.video_filename}")
+            
+            # Get embeddings for this video's target person
+            print(f"\nProcessing folder: {video_folder}")
+            print(f"Loading target person images from: {target_person_dir}")
+            
+            target_embeddings = get_face_embeddings(target_person_dir)
+            if not target_embeddings:
+                print(f"Warning: Could not load any valid target person images from {target_person_dir}")
+                continue
+            
+            print(f'Input video: {video_path}')
+            print(f'Output path: {output_path}')
+            
+            # Process the video
             video_detect(
-                ipath=ipath,
-                opath=opath,
+                ipath=video_path,
+                opath=output_path,
                 centerface=centerface,
                 threshold=threshold,
-                cam=is_cam,
+                cam=False,
                 replacewith=replacewith,
                 mask_scale=mask_scale,
                 ellipse=ellipse,
                 draw_scores=draw_scores,
                 enable_preview=enable_preview,
-                nested=multi_file,
+                nested=True,
                 keep_audio=keep_audio,
                 ffmpeg_config=ffmpeg_config,
                 replaceimg=replaceimg,
                 mosaicsize=mosaicsize,
-                # target_person_image=target_person_image,
                 target_embeddings=target_embeddings,
+                debugging=args.debugging,
             )
-        elif filetype == 'image':
-            image_detect(
-                ipath=ipath,
-                opath=opath,
-                centerface=centerface,
-                threshold=threshold,
-                replacewith=replacewith,
-                mask_scale=mask_scale,
-                ellipse=ellipse,
-                draw_scores=draw_scores,
-                enable_preview=enable_preview,
-                keep_metadata=keep_metadata,
-                replaceimg=replaceimg,
-                mosaicsize=mosaicsize
-            )
-        elif filetype is None:
-            print(f'Can\'t determine file type of file {ipath}. Skipping...')
-        elif filetype == 'notfound':
-            print(f'File {ipath} not found. Skipping...')
-        else:
-            print(f'File {ipath} has an unknown type {filetype}. Skipping...')
+            
+            print(f"Successfully processed {video_folder}")
+            
+        except KeyboardInterrupt:
+            print("\nProcessing interrupted by user")
+            return
+        except Exception as e:
+            print(f"Error processing video folder {video_folder}: {str(e)}")
+            if args.debugging:
+                import traceback
+                traceback.print_exc()
+            continue
 
+    print("\nProcessing complete!")
+    if args.debugging:
+        print(f"Processed {len(video_folders)} video folders")
 
 if __name__ == '__main__':
     main()
