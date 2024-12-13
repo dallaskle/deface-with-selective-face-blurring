@@ -29,85 +29,6 @@ from shapely.geometry import box
 selected_face = None
 face_tracker = None
 
-# Add new function for image preprocessing
-def preprocess_image(image):
-    """
-    Preprocess image to improve quality for face recognition.
-    """
-    # Convert to PIL Image if needed
-    if isinstance(image, np.ndarray):
-        image = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
-    
-    # Upscale image using Lanczos resampling
-    target_size = (512, 512)  # Reasonable size for face recognition
-    image = image.resize(target_size, Image.Resampling.LANCZOS)
-    
-    # Convert back to numpy array
-    image = np.array(image)
-    
-    # Denoise
-    image = cv2.fastNlMeansDenoisingColored(image, None, 10, 10, 7, 21)
-    
-    return image
-
-def init_centerface(in_shape, backend, execution_provider):
-    """Initialize CenterFace with fallback options if the preferred backend fails"""
-    try:
-        # First try with specified settings
-        return CenterFace(
-            in_shape=in_shape,
-            backend=backend,
-            override_execution_provider=execution_provider
-        )
-    except Exception as e:
-        print(f"Warning: Failed to initialize with specified backend ({backend}): {str(e)}")
-        
-        try:
-            # Fallback to OpenCV backend
-            print("Attempting to fallback to OpenCV backend...")
-            return CenterFace(
-                in_shape=in_shape,
-                backend='opencv'
-            )
-        except Exception as e2:
-            print(f"Error: Failed to initialize CenterFace with fallback backend: {str(e2)}")
-            raise
-        
-# Add this function to calculate IoU
-def calculate_iou(box1, box2):
-    """
-    Calculate intersection over union between two boxes.
-    Box format should be (x1, y1, x2, y2) or (x, y, w, h)
-    """
-    # Convert box1 from (x, y, w, h) to (x1, y1, x2, y2) if needed
-    if len(box1) == 4:
-        if isinstance(box1[2], float) and box1[2] < box1[0]:  # Already in x1,y1,x2,y2 format
-            x1_1, y1_1, x2_1, y2_1 = box1
-        else:  # x,y,w,h format
-            x1_1, y1_1, w_1, h_1 = box1
-            x2_1, y2_1 = x1_1 + w_1, y1_1 + h_1
-    
-    # Convert box2 from (x, y, w, h) to (x1, y1, x2, y2) if needed
-    if len(box2) == 4:
-        if isinstance(box2[2], float) and box2[2] < box2[0]:  # Already in x1,y1,x2,y2 format
-            x1_2, y1_2, x2_2, y2_2 = box2
-        else:  # x,y,w,h format
-            x1_2, y1_2, w_2, h_2 = box2
-            x2_2, y2_2 = x1_2 + w_2, y1_2 + h_2
-
-    # Calculate intersection coordinates
-    x1_i = max(x1_1, x1_2)
-    y1_i = max(y1_1, y1_2)
-    x2_i = min(x2_1, x2_2)
-    y2_i = min(y2_1, y2_2)
-
-    # Calculate areas
-    intersection_area = max(0, x2_i - x1_i) * max(0, y2_i - y1_i)
-    box1_area = (x2_1 - x1_1) * (y2_1 - y1_1)
-    box2_area = (x2_2 - x1_2) * (y2_2 - y1_2)
-    union_area = box1_area + box2_area - intersection_area
-
-    return intersection_area / union_area if union_area > 0 else 0.0
 
 def select_face(event, x, y, flags, param):
     global selected_face
@@ -181,7 +102,21 @@ def update_face_tracker(frame, tracker, prev_bbox):
 
 def get_face_embedding(face_image):
     try:
-        result = DeepFace.represent(face_image, model_name="Facenet512", enforce_detection=False)
+        # Scale up small images to minimum size while maintaining aspect ratio
+        min_size = 160  # DeepFace's preferred size
+        height, width = face_image.shape[:2]
+        if height < min_size or width < min_size:
+            scale = min_size / min(height, width)
+            new_width = int(width * scale)
+            new_height = int(height * scale)
+            face_image = cv2.resize(face_image, (new_width, new_height), interpolation=cv2.INTER_LANCZOS4)
+        
+        result = DeepFace.represent(
+            face_image, 
+            model_name="Facenet512", 
+            enforce_detection=False,
+            detector_backend="retinaface"
+        )
         return np.array(result[0]['embedding'])
     except Exception as e:
         print(f"Error getting face embedding: {str(e)}")
@@ -189,62 +124,46 @@ def get_face_embedding(face_image):
 
 def get_face_embeddings(image_directory):
     embeddings = []
-    processed_dir = os.path.join(image_directory, 'processed')
-    os.makedirs(processed_dir, exist_ok=True)
-    
     for image_path in glob.glob(os.path.join(image_directory, '*')):
-        # Skip the processed directory itself
-        if image_path == processed_dir:
-            continue
-            
-        # Skip non-image files
-        if not any(image_path.lower().endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.bmp']):
-            continue
-        
         image = cv2.imread(image_path)
         if image is not None:
-            # Preprocess the image
-            processed_image = preprocess_image(image)
-            
-            # Save processed image
-            processed_path = os.path.join(processed_dir, f'processed_{os.path.basename(image_path)}')
-            cv2.imwrite(processed_path, cv2.cvtColor(processed_image, cv2.COLOR_RGB2BGR))
-            
-            # Get embedding from processed image
-            embedding = get_face_embedding(processed_image)
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            embedding = get_face_embedding(image)
             if embedding is not None:
                 embeddings.append(embedding)
-    
     return embeddings
 
-def is_same_person(face, target_embeddings, threshold=0.4):
+def is_same_person(face, target_embeddings, threshold=0.5):
     face_embedding = get_face_embedding(face)
     
-    if face_embedding is None:
-        return False
+    if face_embedding is None or not target_embeddings:
+        return False, 0.0
     
-    if not target_embeddings:
-        return False
-    
-    total_similarity = 0
+    # Calculate similarity scores
+    similarity_scores = []
     for target_embedding in target_embeddings:
         cosine_similarity = 1 - cosine(face_embedding, target_embedding)
-        total_similarity += cosine_similarity
+        similarity_scores.append(cosine_similarity)
     
-    average_similarity = total_similarity / len(target_embeddings)
-    
-    return average_similarity > threshold
+    # Enhanced matching criteria
+    max_similarity = max(similarity_scores)
+    avg_similarity = sum(similarity_scores) / len(similarity_scores)
 
-def find_person_in_frame(frame, target_embeddings, centerface, threshold, dets):
-    # dets, _ = centerface(frame, threshold=threshold)
+    # print(max_similarity)
+    
+    return max_similarity > threshold, max_similarity
+
+def find_person_in_frame(frame, target_embeddings, centerface, threshold):
+    dets, _ = centerface(frame, threshold=threshold)
     
     for det in dets:
         x1, y1, x2, y2 = map(int, det[:4])
         face_image = frame[y1:y2, x1:x2]
-        if is_same_person(face_image, target_embeddings):
-            return (x1, y1, x2-x1, y2-y1)  # Return as (x, y, w, h)
+        is_match, score = is_same_person(face_image, target_embeddings)  # Get score
+        if is_match:
+            return (x1, y1, x2-x1, y2-y1), face_image, score  # Return face image and score
     
-    return None
+    return None, None, None
 
 def detect_scene_change(prev_frame, curr_frame, threshold=0.1):
     if prev_frame is None or curr_frame is None:
@@ -285,14 +204,13 @@ def draw_det(
         draw_scores: bool = False,
         ovcolor: Tuple[int] = (0, 0, 0),
         replaceimg = None,
-        mosaicsize: int = 20,
-        debugging: bool = False  # Add debugging parameter
+        mosaicsize: int = 20
 ):
     if replacewith == 'solid':
         cv2.rectangle(frame, (x1, y1), (x2, y2), ovcolor, -1)
     elif replacewith == 'blur':
-        bf = 2  # blur factor
-        blurred_box = cv2.blur(
+        bf = 2  # blur factor (number of pixels in each dimension that the face will be reduced to)
+        blurred_box =  cv2.blur(
             frame[y1:y2, x1:x2],
             (abs(x2 - x1) // bf, abs(y2 - y1) // bf)
         )
@@ -303,12 +221,6 @@ def draw_det(
             frame[y1:y2, x1:x2] = roibox
         else:
             frame[y1:y2, x1:x2] = blurred_box
-            
-        # Add colored box around blurred faces when debugging
-        if debugging:
-            # Draw a blue box around blurred faces
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
-
     elif replacewith == 'img':
         target_size = (x2 - x1, y2 - y1)
         resized_replaceimg = cv2.resize(replaceimg, target_size)
@@ -334,8 +246,7 @@ def draw_det(
 
 def anonymize_frame(
         dets, frame, mask_scale,
-        replacewith, ellipse, draw_scores, replaceimg, mosaicsize,
-        debugging: bool = False  # Add debugging parameter
+        replacewith, ellipse, draw_scores, replaceimg, mosaicsize
 ):
     for i, det in enumerate(dets):
         boxes, score = det[:4], det[4]
@@ -350,8 +261,7 @@ def anonymize_frame(
             ellipse=ellipse,
             draw_scores=draw_scores,
             replaceimg=replaceimg,
-            mosaicsize=mosaicsize,
-            debugging=debugging
+            mosaicsize=mosaicsize
         )
 
 
@@ -420,15 +330,10 @@ def video_detect(
 
     face_tracker = None
     target_person_found = False
-    iou_threshold = 0.2
-    prev_frame = None
-    scene_change_threshold = 0.2
+    matched_face = None  # Add this
+    match_score = None  # Add this
 
     for frame in read_iter:
-
-        # Perform network inference, get bb dets but discard landmark predictions
-        dets, _ = centerface(frame, threshold=threshold)
-        flag = True
 
         # Ensure frame is in the correct format (numpy array)
         if isinstance(frame, np.ndarray):
@@ -436,20 +341,58 @@ def video_detect(
         else:
             current_frame = np.array(frame)
 
-        if prev_frame is not None and target_person_found:
-            if detect_scene_change(prev_frame, current_frame, scene_change_threshold):
-                if debugging:  # Add debug message for scene change
-                    print("Scene change detected. Reinitializing face tracking.")
-                face_tracker = None
-                target_person_found = False
+        # if prev_frame is not None:
+        #     if detect_scene_change(prev_frame, current_frame, scene_change_threshold):
+        #         if debugging:  # Add debug message for scene change
+        #             print("Scene change detected. Reinitializing face tracking.")
+        #         face_tracker = None
+        #         target_person_found = False
 
         if not target_person_found:
-            person_bbox = find_person_in_frame(frame, target_embeddings, centerface, threshold, dets)
+            person_bbox, face_img, score = find_person_in_frame(frame, target_embeddings, centerface, threshold)
             if person_bbox is not None:
                 face_tracker, prev_bbox = init_face_tracker(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR), person_bbox)
                 target_person_found = True
+                matched_face = face_img  # Store matched face
+                match_score = score  # Store match score
                 if debugging:  # Add debug message for target person detection
                     print("Target person found and tracking started.")
+
+        if debugging and matched_face is not None and target_person_found:
+            # Define display size for matched face
+            display_size = (100, 100)  # Adjust size as needed
+            matched_face_resized = cv2.resize(matched_face, display_size)
+            
+            # Create space for the matched face in top-right corner
+            y_offset = 10
+            x_offset = frame.shape[1] - display_size[0] - 10
+            
+            # Add matched face
+            frame[y_offset:y_offset+display_size[1], x_offset:x_offset+display_size[0]] = matched_face_resized
+            
+            # Add score text below the face
+            text = f"Score: {match_score:.3f}"
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale = 0.5
+            thickness = 1
+            text_size = cv2.getTextSize(text, font, font_scale, thickness)[0]
+            
+            text_x = x_offset + (display_size[0] - text_size[0]) // 2
+            text_y = y_offset + display_size[1] + 20
+            
+            # Draw black background for text
+            cv2.rectangle(frame, 
+                        (text_x - 5, text_y - text_size[1] - 5),
+                        (text_x + text_size[0] + 5, text_y + 5),
+                        (0, 0, 0), -1)
+            
+            # Draw text
+            cv2.putText(frame, text, (text_x, text_y),
+                       font, font_scale, (255, 255, 255), thickness)
+
+        # Perform network inference, get bb dets but discard landmark predictions
+        dets, _ = centerface(frame, threshold=threshold)
+        flag = True
 
         if face_tracker is not None:
             bgr_frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
@@ -458,25 +401,35 @@ def video_detect(
                 flag = True
                 x1, y1, x2, y2 = map(int, tracked_bbox)
                 
-                # Calculate IoU for each detection with the tracked box
-                ious = [calculate_iou(tracked_bbox, (det[0], det[1], det[2], det[3])) for det in dets]
-                
-                dets_in_tracked = [
-                    det for det, iou in zip(dets, ious)
-                    if (x1 < det[0] < x2 and y1 < det[1] < y2) or iou > iou_threshold
-                ]
+                # Keep detections that are within the tracked region
+                dets_in_tracked = [det for det in dets if ((x1 < det[0] < x2 and y1 < det[1] < y2))]
+
+                # Add face count overlay to frame
+                if debugging:
+                    # Define text properties
+                    text = f"Faces in tracked region: {len(dets_in_tracked)}"
+                    font = cv2.FONT_HERSHEY_SIMPLEX
+                    font_scale = 0.7
+                    thickness = 2
+                    color = (0, 255, 0)  # Green color
+                    
+                    # Get text size to create background
+                    (text_width, text_height), _ = cv2.getTextSize(text, font, font_scale, thickness)
+                    
+                    # Draw black background rectangle
+                    cv2.rectangle(frame, (10, 10), (text_width + 20, text_height + 20), (0, 0, 0), -1)
+                    
+                    # Add text
+                    cv2.putText(frame, text, (15, text_height + 15), font, font_scale, color, thickness)
+
+                # if len(dets_in_tracked) < 2:
+                dets = [det for det in dets if not ((x1 < det[0] < x2 and y1 < det[1] < y2))]
 
                 if len(dets_in_tracked) == 0:
                     if debugging:
                         print("No faces found in tracking region, resetting tracker")
                     face_tracker = None
                     target_person_found = False
-
-                # # if len(dets_in_tracked) < 2:
-                # dets = [
-                #     det for det, iou in zip(dets, ious)
-                #     if not ((x1 < det[0] < x2 and y1 < det[1] < y2) or iou > iou_threshold)
-                # ]
 
                 # Only draw boxes if debugging is enabled
                 if debugging:
@@ -500,7 +453,7 @@ def video_detect(
         anonymize_frame(
             dets, frame, mask_scale=mask_scale,
             replacewith=replacewith, ellipse=ellipse, draw_scores=draw_scores,
-            replaceimg=replaceimg, mosaicsize=mosaicsize, debugging=debugging
+            replaceimg=replaceimg, mosaicsize=mosaicsize,
         )
 
         if opath is not None:
@@ -643,7 +596,7 @@ def parse_cli_args():
         '--draw-scores', default=False, action='store_true',
         help='Draw detection scores onto outputs.')
     parser.add_argument(
-        '--mask-scale', default=1.3, type=float, metavar='M',
+        '--mask-scale', default=1.5, type=float, metavar='M',
         help='Scale factor for face masks, to make sure that masks cover the complete face. Default: 1.3.')
     parser.add_argument(
         '--replacewith', default='blur', choices=['blur', 'solid', 'none', 'img', 'mosaic'],
@@ -701,41 +654,20 @@ def main():
     mask_scale = args.mask_scale
     keep_audio = args.keep_audio
     ffmpeg_config = args.ffmpeg_config
+    backend = args.backend
+    in_shape = args.scale
+    execution_provider = args.execution_provider
     mosaicsize = args.mosaicsize
     keep_metadata = args.keep_metadata
     replaceimg = None
-
-    # Handle scale argument
-    if args.scale is not None:
-        try:
-            w, h = args.scale.split('x')
-            in_shape = (int(w), int(h))
-        except ValueError:
-            print(f"Error: Invalid scale format. Expected WxH (e.g., 640x360), got {args.scale}")
-            return
-    else:
-        in_shape = None
-
-    # Handle replace image if specified
+    if in_shape is not None:
+        w, h = in_shape.split('x')
+        in_shape = int(w), int(h)
     if replacewith == "img":
-        try:
             replaceimg = imageio.imread(args.replaceimg)
-            print(f'Loaded replacement image {args.replaceimg}, shape: {replaceimg.shape}')
-        except Exception as e:
-            print(f"Error loading replacement image: {str(e)}")
-            return
 
     # Initialize CenterFace
-    try:
-        centerface = init_centerface(
-            in_shape=in_shape,
-            backend=args.backend,
-            execution_provider=args.execution_provider
-        )
-        print("Successfully initialized face detection model")
-    except Exception as e:
-        print(f"Fatal error: Could not initialize face detection model: {str(e)}")
-        return
+    centerface = CenterFace(in_shape=in_shape, backend=backend, override_execution_provider=execution_provider)
 
     # Verify input directory exists
     if not os.path.isdir(args.input_dir):
