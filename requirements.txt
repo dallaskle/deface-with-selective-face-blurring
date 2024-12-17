@@ -1,0 +1,13 @@
+deface
+imageio-ffmpeg
+imageio
+opencv-contrib-python==4.10.0.84
+scikit-image
+tqdm
+deepface
+onnx
+onnxruntime-gpu
+shapely
+tf-keras
+tensorflow=2.14.0
+tensorrt
