@@ -90,7 +90,7 @@ def update_face_tracker(frame, tracker, prev_bbox):
         new_w, new_h = bbox[2] - bbox[0], bbox[3] - bbox[1]
         prev_w, prev_h = prev_bbox[2] - prev_bbox[0], prev_bbox[3] - prev_bbox[1]
         
-        max_change = 0.1
+        max_change = 0
         
         # Check if prev_w or prev_h is zero to avoid division by zero
         if prev_w > 0 and prev_h > 0:
@@ -140,6 +140,40 @@ def resize_for_reid(image, target_size=(256, 128)):
     canvas[y_offset:y_offset+new_h, x_offset:x_offset+new_w] = resized
     
     return canvas
+
+def calculate_containment_ratio(det_box, tracking_box, debugging=False):
+    """Calculate how much of the detection box is contained within the tracking box"""
+    # Convert detection box from [x, y, w, h] to [x1, y1, x2, y2] format
+    det_x1, det_y1 = det_box[0], det_box[1]
+    det_x2, det_y2 = (
+        det_x1 + det_box[2],  # x + width
+        det_y1 + det_box[3]   # y + height
+    )
+    
+    # Tracking box is already in [x1, y1, x2, y2] format
+    track_x1, track_y1, track_x2, track_y2 = tracking_box
+    
+    # Calculate intersection coordinates
+    x1 = max(det_x1, track_x1)
+    y1 = max(det_y1, track_y1)
+    x2 = min(det_x2, track_x2)
+    y2 = min(det_y2, track_y2)
+    
+    # Calculate areas
+    intersection_area = max(0, x2 - x1) * max(0, y2 - y1)
+    det_area = (det_x2 - det_x1) * (det_y2 - det_y1)
+    
+    ratio = intersection_area / det_area if det_area > 0 else 0
+    
+    # if ratio<0.3:
+    #     print(f"Detection box: ({det_x1}, {det_y1}, {det_x2}, {det_y2})")
+    #     print(f"Tracking box: ({track_x1}, {track_y1}, {track_x2}, {track_y2})")
+    #     print(f"Intersection area: {intersection_area}")
+    #     print(f"Detection area: {det_area}")
+    #     print(f"Containment ratio: {ratio}")
+    
+    return ratio
+
 
 def get_face_embedding(face_image):
     try:
@@ -253,8 +287,26 @@ def find_person_in_frame(frame, target_embeddings, threshold, person_detector, e
             
             person_dets, _ = centerface(person_img)
             if len(person_dets) > 0:
-                # Sort faces by vertical position (y1 coordinate)
-                face_det = max(person_dets, key=lambda x: x[1])  # Select face with smallest y1 value
+                # Get person bbox height
+                person_height = y2 - y1
+                
+                # Filter faces based on center point being in top half
+                valid_faces = []
+                for det in person_dets:
+                    # Calculate face center y-coordinate
+                    face_center_y = (det[1] + det[3]) / 2  # (y1 + y2) / 2
+                    
+                    # Check if face center is in top half
+                    if face_center_y < (person_height / 2):
+                        valid_faces.append(det)
+                
+                if valid_faces:
+                    # If faces found in top half, select the largest one
+                    face_det = max(valid_faces, key=lambda x: (x[2]-x[0]) * (x[3]-x[1]))  # area = width * height
+                else:
+                    # If no faces with center in top half, return None
+                    return None, None, 0, None
+                    
                 fx1, fy1, fx2, fy2 = map(int, face_det[:4])
                 
                 face_box = (
@@ -505,9 +557,39 @@ def video_detect(
             if tracked_bbox is not None:
                 flag = True
                 x1, y1, x2, y2 = map(int, tracked_bbox)
+                tracked_box = [x1, y1, x2, y2]
                 
-                # Keep detections that are within the tracked region
-                dets_in_tracked = [det for det in dets if ((x1 < det[0] < x2 and y1 < det[1] < y2))]
+                # # Find detections that overlap significantly with tracked region
+                # dets_in_tracked = []
+                CONTAINMENT_THRESHOLD = 0.7  # Lower threshold to be more lenient
+                
+                # for det in dets:
+                #     # Extract detection coordinates and ensure they're in the right format
+                #     det_box = [
+                #         int(det[0]),  # x
+                #         int(det[1]),  # y
+                #         int(det[2] - det[0]),  # width
+                #         int(det[3] - det[1])   # height
+                #     ]
+                    
+                #     containment = calculate_containment_ratio(det_box, tracked_box, debugging)
+
+                #     if containment > CONTAINMENT_THRESHOLD:
+                #         dets_in_tracked.append(det)
+                #     elif debugging:
+                #         print(f"Face detection rejected with containment ratio: {containment}")
+
+                # Calculate IoU for each detection with the tracked box
+                containments = [calculate_containment_ratio((det[0], det[1], det[2]-det[0], det[3]-det[1]), tracked_bbox, debugging) for det in dets]
+                
+                dets_in_tracked = [
+                    det for det in dets
+                    if calculate_containment_ratio(
+                        (det[0], det[1], det[2]-det[0], det[3]-det[1]),  # Convert to [x, y, w, h]
+                        tracked_bbox,
+                        debugging
+                    ) > CONTAINMENT_THRESHOLD
+                ]
 
                 # Add debugging overlays
                 if debugging:
@@ -563,8 +645,21 @@ def video_detect(
                         cv2.putText(current_frame, score_text, (text_x, text_y),
                                 font, 0.5, (255, 255, 255), 1)
 
-                # Remove tracked face from detections to avoid double anonymization
-                dets = [det for det in dets if not ((x1 < det[0] < x2 and y1 < det[1] < y2))]
+                # If multiple faces detected in tracking region, keep all detections
+                if len(dets_in_tracked) > 1:
+                    if debugging:
+                        print(f"Multiple faces ({len(dets_in_tracked)}) detected in tracking region")
+                    # Don't remove any detections
+                else:
+                    # Remove tracked face from detections to avoid double anonymization
+                    dets = [
+                    det for det in dets
+                    if calculate_containment_ratio(
+                        (det[0], det[1], det[2]-det[0], det[3]-det[1]),  # Convert to [x, y, w, h]
+                        tracked_bbox,
+                        debugging
+                    ) < CONTAINMENT_THRESHOLD
+                    ]
 
                 # Update tracking status
                 if len(dets_in_tracked) == 0:
@@ -593,11 +688,11 @@ def video_detect(
                         break
 
         # Anonymize remaining faces
-        # anonymize_frame(
-        #     dets, current_frame, mask_scale=mask_scale,
-        #     replacewith=replacewith, ellipse=ellipse, draw_scores=draw_scores,
-        #     replaceimg=replaceimg, mosaicsize=mosaicsize,
-        # )
+        anonymize_frame(
+            dets, current_frame, mask_scale=mask_scale,
+            replacewith=replacewith, ellipse=ellipse, draw_scores=draw_scores,
+            replaceimg=replaceimg, mosaicsize=mosaicsize,
+        )
 
         if opath is not None:
             writer.append_data(current_frame)
@@ -723,7 +818,7 @@ def parse_cli_args():
     )
 
     parser.add_argument(
-        '--thresh', '-t', default=0.2, type=float, metavar='T',
+        '--thresh', '-t', default=0.3, type=float, metavar='T',
         help='Detection threshold (tune this to trade off between false positive and false negative rate). Default: 0.2.')
     parser.add_argument(
         '--scale', '-s', default=None, metavar='WxH',
