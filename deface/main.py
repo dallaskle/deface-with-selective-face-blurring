@@ -22,6 +22,7 @@ from deface.centerface import CenterFace
 
 # New imports
 from scipy.spatial.distance import cosine
+from torch.nn.functional import cosine_similarity
 
 from shapely.geometry import box
 from ultralytics import YOLO  # Add this import for person detection
@@ -59,30 +60,45 @@ def init_reid_model():
     
     return model, cfg
 
-def init_face_tracker(frame, bbox):
-    x, y, w, h = bbox
-    center_x = x + w / 2
-    center_y = y + h / 2
+def init_face_tracker(frame, face_bbox, person_bbox=None):
+    """
+    Initialize tracker with face bbox, using person width if available
+    face_bbox: (x, y, w, h) of face detection
+    person_bbox: (x, y, w, h) of person detection (optional)
+    """
+    x, y, w, h = face_bbox
     
-    # Use the larger dimension to create a square
-    side_length = max(w, h) * 2.5  # Scale factor of 2.5
-    
-    # Calculate new coordinates to maintain center
-    new_x = center_x - side_length / 2
-    new_y = center_y - side_length / 2
+    if person_bbox is not None:
+        # Use person width but keep face y-coordinates
+        person_w = person_bbox[2]  # Width of person detection
+        center_x = x + w / 2
+        
+        # Use person width but keep face y-coordinates
+        new_w = person_w
+        new_h = h  # Keep face height
+        new_x = center_x - new_w / 2
+        new_y = y  # Keep face y-coordinate
+    else:
+        # Fallback to original behavior
+        center_x = x + w / 2
+        center_y = y + h / 2
+        side_length = max(w, h) * 3
+        new_x = center_x - side_length / 2
+        new_y = center_y - side_length / 2
+        new_w = side_length
+        new_h = side_length
     
     # Ensure the new bounding box stays within the frame
     new_x = max(0, new_x)
     new_y = max(0, new_y)
-    side_length = min(side_length, frame.shape[1] - new_x)  # Constrain by width
-    side_length = min(side_length, frame.shape[0] - new_y)  # Constrain by height
+    new_w = min(new_w, frame.shape[1] - new_x)
+    new_h = min(new_h, frame.shape[0] - new_y)
     
-    new_bbox = (int(new_x), int(new_y), int(side_length), int(side_length))
+    new_bbox = (int(new_x), int(new_y), int(new_w), int(new_h))
     
     tracker = cv2.TrackerCSRT_create()
     tracker.init(frame, new_bbox)
     return tracker, new_bbox
-
 def update_face_tracker(frame, tracker, prev_bbox):
     success, bbox = tracker.update(frame)
     if success:
@@ -239,7 +255,6 @@ def get_person_embeddings(image_directory, extractor):
         image = cv2.imread(image_path)
         if image is not None:
             image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            # Resize image to standard ReID size while maintaining aspect ratio
             image = resize_for_reid(image)
             images.append(image)
     
@@ -250,7 +265,7 @@ def get_person_embeddings(image_directory, extractor):
     features = extractor(images)
     return list(features.cpu().numpy())
 
-def find_person_in_frame(frame, target_embeddings, threshold, person_detector, extractor, centerface):
+def find_person_in_frame(frame, target_embeddings, threshold, person_detector, extractor, frame_face_dets):
     """Find target person and their face in frame"""
     # Detect people in the frame
     results = person_detector(frame, verbose=False)[0]
@@ -259,7 +274,7 @@ def find_person_in_frame(frame, target_embeddings, threshold, person_detector, e
     # Filter for person detections with good confidence
     for result in results.boxes.data:
         if result[5] == 0:  # Class 0 is person in COCO
-            if result[4] >= 0.3:  # Confidence threshold
+            if result[4] >= 0.15:  # Confidence threshold
                 person_boxes.append(result[:4].cpu().numpy())
     
     if not person_boxes:
@@ -285,40 +300,94 @@ def find_person_in_frame(frame, target_embeddings, threshold, person_detector, e
             x1, y1, x2, y2 = map(int, person_box)
             person_img = frame[y1:y2, x1:x2]
             
-            person_dets, _ = centerface(person_img)
-            if len(person_dets) > 0:
-                # Get person bbox height
-                person_height = y2 - y1
+            # Find faces that intersect with the person box
+            valid_faces = []
+            for det in frame_face_dets:
+                # Convert face detection to absolute coordinates
+                face_x1, face_y1 = det[0], det[1]
+                face_x2, face_y2 = det[2], det[3]
                 
-                # Filter faces based on center point being in top half
-                valid_faces = []
-                for det in person_dets:
-                    # Calculate face center y-coordinate
-                    face_center_y = (det[1] + det[3]) / 2  # (y1 + y2) / 2
+                # Check if face intersects with person box
+                if (face_x1 < x2 and face_x2 > x1 and 
+                    face_y1 < y2 and face_y2 > y1):
+                    # Calculate face center y-coordinate relative to person box
+                    face_center_y = (face_y1 + face_y2) / 2 - y1
+                    person_height = y2 - y1
                     
-                    # Check if face center is in top half
+                    # Check if face center is in top half of person
                     if face_center_y < (person_height / 2):
                         valid_faces.append(det)
+            if valid_faces:
+                # If faces found in top half, select the largest one
+                face_det = max(valid_faces, key=lambda x: (x[2]-x[0]) * (x[3]-x[1]))
                 
-                if valid_faces:
-                    # If faces found in top half, select the largest one
-                    face_det = max(valid_faces, key=lambda x: (x[2]-x[0]) * (x[3]-x[1]))  # area = width * height
-                else:
-                    # If no faces with center in top half, return None
-                    return None, None, 0, None
-                    
                 fx1, fy1, fx2, fy2 = map(int, face_det[:4])
                 
                 face_box = (
-                    x1 + fx1,
-                    y1 + fy1,
-                    fx2 - fx1,
-                    fy2 - fy1
+                    fx1,  # Already in absolute coordinates
+                    fy1,
+                    fx2 - fx1,  # Convert to width
+                    fy2 - fy1   # Convert to height
                 )
-                face_img = frame[y1+fy1:y1+fy2, x1+fx1:x1+fx2]
+                face_img = frame[fy1:fy2, fx1:fx2]
                 return face_box, face_img, score, person_img
     
     return None, None, 0, None
+
+def recover_tracking(frame, prev_bbox, dets, debugging=False):
+    """
+    Recovery strategy:
+    1. Use existing face detections from the frame
+    2. Pick the face closest to the previous position
+    """
+    # Get previous bbox center
+    prev_x1, prev_y1, prev_x2, prev_y2 = prev_bbox
+    prev_center_x = (prev_x1 + prev_x2) / 2
+    prev_center_y = (prev_y1 + prev_y2) / 2
+    prev_width = prev_x2 - prev_x1
+    prev_height = prev_y2 - prev_y1
+    
+    # Define search region (1.5x the previous bbox size)
+    search_width = prev_width * 2
+    search_height = prev_height * 2
+    
+    # Calculate search region boundaries
+    search_x1 = prev_center_x - search_width/2
+    search_y1 = prev_center_y - search_height/2
+    search_x2 = search_x1 + search_width
+    search_y2 = search_y1 + search_height
+    
+    best_det = None
+    min_distance = float('inf')
+    
+    for det in dets:
+        # Calculate center of current detection
+        det_center_x = (det[0] + det[2]) / 2
+        det_center_y = (det[1] + det[3]) / 2
+        
+        # Check if detection center is within search region
+        if (search_x1 <= det_center_x <= search_x2 and 
+            search_y1 <= det_center_y <= search_y2):
+            
+            # Calculate distance to previous center
+            distance = np.sqrt(
+                (det_center_x - prev_center_x)**2 + 
+                (det_center_y - prev_center_y)**2
+            )
+            
+            if distance < min_distance:
+                min_distance = distance
+                best_det = (
+                    det[0], det[1],  # x1, y1
+                    det[2] - det[0],  # width
+                    det[3] - det[1]   # height
+                )
+    
+    if debugging and best_det is not None:
+        print(f"Recovery found face at distance: {min_distance:.2f} pixels")
+        
+    return best_det if min_distance < prev_width else None
+
 
 def compare_embeddings(embedding, target_embeddings, threshold=0.7):
     """Compare person embeddings using average cosine similarity"""
@@ -457,15 +526,30 @@ def video_detect(
         debugging: bool = False,
         person_detector = None,
         reid_model = None,
+        debug_start: float = None,  # New parameter with default None
+        debug_duration: float = None,  # New parameter with default None
 ):
-    global face_tracker
-
     try:
-        if 'fps' in ffmpeg_config:
-            reader = imageio.get_reader(ipath, fps=ffmpeg_config['fps'])
+        # Initialize reader based on debug parameters
+        if debug_start is not None:
+            if debugging:
+                print(f"Starting video processing from {debug_start} seconds")
+                if debug_duration:
+                    print(f"Processing for {debug_duration} seconds")
+            
+            _ffmpeg_config = ffmpeg_config.copy()
+            input_params = ['-ss', str(debug_start)]
+            if debug_duration:
+                input_params.extend(['-t', str(debug_duration)])
+            
+            reader = imageio.get_reader(ipath, size=None, fps=None, input_params=input_params)
         else:
-            reader = imageio.get_reader(ipath)
+            if 'fps' in ffmpeg_config:
+                reader = imageio.get_reader(ipath, fps=ffmpeg_config['fps'])
+            else:
+                reader = imageio.get_reader(ipath)
 
+        # Rest of the existing video_detect function remains the same
         meta = reader.get_meta_data()
         _ = meta['size']
     except:
@@ -498,7 +582,7 @@ def video_detect(
     # Initialize tracking variables
     face_tracker = None
     frames_without_faces = 0
-    MAX_FRAMES_WITHOUT_FACES = 20
+    MAX_FRAMES_WITHOUT_FACES = 30
     target_person_found = False
     matched_face = None
     match_score = None
@@ -534,7 +618,7 @@ def video_detect(
                 REID_SIMILARITY_THRESHOLD,
                 person_detector,
                 reid_model,
-                centerface
+                dets  # Pass the face detections here
             )
             
             if person_bbox is not None:
@@ -553,6 +637,24 @@ def video_detect(
         if face_tracker is not None:
             bgr_frame = cv2.cvtColor(current_frame, cv2.COLOR_RGB2BGR)
             tracked_bbox = update_face_tracker(bgr_frame, face_tracker, prev_bbox)
+
+            if tracked_bbox is None:
+                if debugging:
+                    print("Tracking failed, attempting recovery...")
+                
+                recovered_bbox = recover_tracking(current_frame, prev_bbox, dets, debugging)
+                
+                if recovered_bbox is not None:
+                    # Reinitialize tracker with recovered detection
+                    face_tracker, prev_bbox = init_face_tracker(bgr_frame, recovered_bbox)
+                    tracked_bbox = prev_bbox
+                    if debugging:
+                        print("Tracking recovered")
+                else:
+                    if debugging:
+                        print("Recovery failed")
+                    face_tracker = None
+                    target_person_found = False
             
             if tracked_bbox is not None:
                 flag = True
@@ -650,26 +752,88 @@ def video_detect(
                     if debugging:
                         print(f"Multiple faces ({len(dets_in_tracked)}) detected in tracking region")
                     # Don't remove any detections
+                elif len(dets_in_tracked) == 1:
+                    # Update tracking region to center on the single detected face
+                    det = dets_in_tracked[0]
+                    det_center_x = (det[0] + det[2]) / 2  # (x1 + x2) / 2
+                    det_center_y = (det[1] + det[3]) / 2  # (y1 + y2) / 2
+                    
+                    # Calculate current tracking box dimensions
+                    track_width = tracked_bbox[2] - tracked_bbox[0]
+                    track_height = tracked_bbox[3] - tracked_bbox[1]
+                    
+                    # Update tracking box coordinates to center on detection
+                    tracked_bbox = (
+                        det_center_x - track_width / 2,  # new x1
+                        det_center_y - track_height / 2,  # new y1
+                        det_center_x + track_width / 2,  # new x2
+                        det_center_y + track_height / 2   # new y2
+                    )
+                    
+                    # Update tracker with new position
+                    face_tracker = cv2.TrackerCSRT_create()
+                    face_tracker.init(bgr_frame, (
+                        int(tracked_bbox[0]),
+                        int(tracked_bbox[1]),
+                        int(track_width),
+                        int(track_height)
+                    ))
+                    
+                    prev_bbox = tracked_bbox
+                    
+                    # Remove tracked face from detections to avoid double anonymization
+                    dets = [
+                        det for det in dets
+                        if calculate_containment_ratio(
+                            (det[0], det[1], det[2]-det[0], det[3]-det[1]),  # Convert to [x, y, w, h]
+                            tracked_bbox,
+                            debugging
+                        ) < CONTAINMENT_THRESHOLD
+                    ]
+                    
                 else:
                     # Remove tracked face from detections to avoid double anonymization
                     dets = [
-                    det for det in dets
-                    if calculate_containment_ratio(
-                        (det[0], det[1], det[2]-det[0], det[3]-det[1]),  # Convert to [x, y, w, h]
-                        tracked_bbox,
-                        debugging
-                    ) < CONTAINMENT_THRESHOLD
+                        det for det in dets
+                        if calculate_containment_ratio(
+                            (det[0], det[1], det[2]-det[0], det[3]-det[1]),  # Convert to [x, y, w, h]
+                            tracked_bbox,
+                            debugging
+                        ) < CONTAINMENT_THRESHOLD
                     ]
 
                 # Update tracking status
                 if len(dets_in_tracked) == 0:
+                    # Check if tracking box is near frame edges
+                    frame_height, frame_width = current_frame.shape[:2]
+                    edge_threshold = 20  # pixels from edge to consider "near edge"
+                    
+                    is_near_edge = (
+                        tracked_bbox[0] <= edge_threshold or  # Left edge
+                        tracked_bbox[1] <= edge_threshold or  # Top edge
+                        tracked_bbox[2] >= frame_width - edge_threshold or  # Right edge
+                        tracked_bbox[3] >= frame_height - edge_threshold  # Bottom edge
+                    )
+                    # Attempt recovery when not near edge
+                    if debugging:
+                        print("No faces in tracking box, attempting recovery...")
+                    recovered_bbox = recover_tracking(current_frame, prev_bbox, dets, debugging)
+                    
+                    if recovered_bbox is not None:
+                        # Reinitialize tracker with recovered detection
+                        face_tracker, prev_bbox = init_face_tracker(bgr_frame, recovered_bbox)
+                        frames_without_faces = 0
+                        if debugging:
+                            print("Tracking recovered successfully")
+                    
                     frames_without_faces += 1
                     if frames_without_faces >= MAX_FRAMES_WITHOUT_FACES:
-                        if debugging:
-                            print(f"No faces found in tracking region for {MAX_FRAMES_WITHOUT_FACES} frames, resetting tracker")
-                        face_tracker = None
-                        target_person_found = False
-                        frames_without_faces = 0
+                        if is_near_edge:
+                            if debugging:
+                                print(f"No faces found in tracking region for {MAX_FRAMES_WITHOUT_FACES} frames and tracker near frame edge, resetting tracker")
+                            face_tracker = None
+                            target_person_found = False
+                            frames_without_faces = 0
                 else:
                     frames_without_faces = 0
 
