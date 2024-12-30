@@ -1,49 +1,44 @@
 #!/usr/bin/env python3
 
+# Standard library imports
 import argparse
 import json
 import mimetypes
 import os
 from typing import Dict, Tuple, List, Optional
+import glob
 
-import tqdm
-import skimage.draw
+# Third-party imports
 import numpy as np
+import cv2
+import torch
+import tqdm
 import imageio
 import imageio.v2 as iio
-import imageio.plugins.ffmpeg
+from ultralytics import YOLO
 from PIL import Image
-import cv2
-import glob
-from deepface import DeepFace
 
-from deface import __version__
-from deface.centerface import CenterFace
-
-# New imports
-from scipy.spatial.distance import cosine
-from torch.nn.functional import cosine_similarity
-
-from shapely.geometry import box
-from ultralytics import YOLO  # Add this import for person detection
-
-# Add after other global variables
-person_detector = YOLO('yolov8n.pt')
-
-# Global variables for face tracking
-selected_face = None
-face_tracker = None
-
-# Add new imports at the top
-import torch
-import torchvision.transforms as T
+# Deep learning models and configs
 from fastreid.config import get_cfg
 from fastreid.modeling.meta_arch import build_model
-from reid.torchreid.utils import FeatureExtractor  # Add this import
 from fastreid.utils.checkpoint import Checkpointer
+from reid.torchreid.utils import FeatureExtractor
 
-# Add after other global variables
+# Local imports
+from deface import __version__
+from deface.centerface import CenterFace
+from tracking import init_face_tracker, update_face_tracker, recover_tracking
+from recognition import (
+    resize_for_reid, 
+    get_person_embeddings, 
+    compare_embeddings, 
+    find_person_in_frame
+)
+
+# Global variables
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+person_detector = YOLO('yolov8n.pt')
+face_tracker = None
 
 def init_reid_model():
     """Initialize FastReID model with ResNet50-IBN backbone"""
@@ -59,103 +54,6 @@ def init_reid_model():
     model.to(DEVICE).eval()
     
     return model, cfg
-
-def init_face_tracker(frame, face_bbox, person_bbox=None):
-    """
-    Initialize tracker with face bbox, using person width if available
-    face_bbox: (x, y, w, h) of face detection
-    person_bbox: (x, y, w, h) of person detection (optional)
-    """
-    x, y, w, h = face_bbox
-    
-    if person_bbox is not None:
-        # Use person width but keep face y-coordinates
-        person_w = person_bbox[2]  # Width of person detection
-        center_x = x + w / 2
-        
-        # Use person width but keep face y-coordinates
-        new_w = person_w
-        new_h = h  # Keep face height
-        new_x = center_x - new_w / 2
-        new_y = y  # Keep face y-coordinate
-    else:
-        # Fallback to original behavior
-        center_x = x + w / 2
-        center_y = y + h / 2
-        side_length = max(w, h) * 3
-        new_x = center_x - side_length / 2
-        new_y = center_y - side_length / 2
-        new_w = side_length
-        new_h = side_length
-    
-    # Ensure the new bounding box stays within the frame
-    new_x = max(0, new_x)
-    new_y = max(0, new_y)
-    new_w = min(new_w, frame.shape[1] - new_x)
-    new_h = min(new_h, frame.shape[0] - new_y)
-    
-    new_bbox = (int(new_x), int(new_y), int(new_w), int(new_h))
-    
-    tracker = cv2.TrackerCSRT_create()
-    tracker.init(frame, new_bbox)
-    return tracker, new_bbox
-def update_face_tracker(frame, tracker, prev_bbox):
-    success, bbox = tracker.update(frame)
-    if success:
-        bbox = (bbox[0], bbox[1], bbox[0] + bbox[2], bbox[1] + bbox[3])
-        new_w, new_h = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        prev_w, prev_h = prev_bbox[2] - prev_bbox[0], prev_bbox[3] - prev_bbox[1]
-        
-        max_change = 0
-        
-        # Check if prev_w or prev_h is zero to avoid division by zero
-        if prev_w > 0 and prev_h > 0:
-            w_change = abs(new_w - prev_w) / prev_w
-            h_change = abs(new_h - prev_h) / prev_h
-            
-            if w_change > max_change or h_change > max_change:
-                center_x, center_y = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
-                bbox = (
-                    center_x - prev_w / 2,
-                    center_y - prev_h / 2,
-                    center_x + prev_w / 2,
-                    center_y + prev_h / 2
-                )
-        else:
-            # If prev_w or prev_h is zero, use the new bbox as is
-            pass
-
-        return bbox
-    return None
-
-def resize_for_reid(image, target_size=(256, 128)):
-    """Resize image to ReID model's expected size while maintaining aspect ratio"""
-    h, w = image.shape[:2]
-    target_h, target_w = target_size
-    
-    # Calculate scaling factors
-    scale_w = target_w / w
-    scale_h = target_h / h
-    scale = min(scale_w, scale_h)
-    
-    # Calculate new dimensions
-    new_w = int(w * scale)
-    new_h = int(h * scale)
-    
-    # Resize image maintaining aspect ratio
-    resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-    
-    # Create blank canvas of target size
-    canvas = np.zeros((target_h, target_w, 3), dtype=np.uint8)
-    
-    # Calculate padding
-    x_offset = (target_w - new_w) // 2
-    y_offset = (target_h - new_h) // 2
-    
-    # Place resized image on canvas
-    canvas[y_offset:y_offset+new_h, x_offset:x_offset+new_w] = resized
-    
-    return canvas
 
 def calculate_containment_ratio(det_box, tracking_box, debugging=False):
     """Calculate how much of the detection box is contained within the tracking box"""
@@ -180,249 +78,7 @@ def calculate_containment_ratio(det_box, tracking_box, debugging=False):
     det_area = (det_x2 - det_x1) * (det_y2 - det_y1)
     
     ratio = intersection_area / det_area if det_area > 0 else 0
-    
-    # if ratio<0.3:
-    #     print(f"Detection box: ({det_x1}, {det_y1}, {det_x2}, {det_y2})")
-    #     print(f"Tracking box: ({track_x1}, {track_y1}, {track_x2}, {track_y2})")
-    #     print(f"Intersection area: {intersection_area}")
-    #     print(f"Detection area: {det_area}")
-    #     print(f"Containment ratio: {ratio}")
-    
     return ratio
-
-
-def get_face_embedding(face_image):
-    try:
-        # Scale up small images to minimum size while maintaining aspect ratio
-        # min_size = 160  # DeepFace's preferred size
-        # height, width = face_image.shape[:2]
-        # if height < min_size or width < min_size:
-        #     scale = min_size / min(height, width)
-        #     new_width = int(width * scale)
-        #     new_height = int(height * scale)
-        #     face_image = cv2.resize(face_image, (new_width, new_height), interpolation=cv2.INTER_LANCZOS4)
-        
-        result = DeepFace.represent(
-            face_image, 
-            model_name="Facenet512", 
-            enforce_detection=False,
-            detector_backend="mtcnn",
-            align = True,
-        )
-        return np.array(result[0]['embedding'])
-    except Exception as e:
-        # Face detection failed or other error occurred
-        if "Face could not be detected" in str(e):
-            return None  # Return None if no face detected
-        print(f"Error getting face embedding: {str(e)}")
-        return None
-
-def get_face_embeddings(image_directory):
-    embeddings = []
-    for image_path in glob.glob(os.path.join(image_directory, '*')):
-        image = cv2.imread(image_path)
-        if image is not None:
-            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            embedding = get_face_embedding(image)
-            if embedding is not None:
-                embeddings.append(embedding)
-    return embeddings
-
-def is_same_person(face, target_embeddings, threshold=0.7):
-    face_embedding = get_face_embedding(face)
-    
-    if face_embedding is None or not target_embeddings:
-        return False, 0.0
-    
-    # Calculate similarity scores
-    similarity_scores = []
-    for target_embedding in target_embeddings:
-        cosine_similarity = 1 - cosine(face_embedding, target_embedding)
-        similarity_scores.append(cosine_similarity)
-    
-    # Enhanced matching criteria
-    max_similarity = max(similarity_scores)
-    avg_similarity = sum(similarity_scores) / len(similarity_scores)
-
-    # print(max_similarity)
-    
-    return max_similarity > threshold, max_similarity
-
-def get_person_embeddings(image_directory, extractor):
-    """Get embeddings for all target person images"""
-    images = []
-    for image_path in glob.glob(os.path.join(image_directory, '*')):
-        image = cv2.imread(image_path)
-        if image is not None:
-            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            image = resize_for_reid(image)
-            images.append(image)
-    
-    if not images:
-        return []
-    
-    # Extract features for all images at once
-    features = extractor(images)
-    return list(features.cpu().numpy())
-
-def find_person_in_frame(frame, target_embeddings, threshold, person_detector, extractor, frame_face_dets):
-    """Find target person and their face in frame"""
-    # Detect people in the frame
-    results = person_detector(frame, verbose=False)[0]
-    person_boxes = []
-    
-    # Filter for person detections with good confidence
-    for result in results.boxes.data:
-        if result[5] == 0:  # Class 0 is person in COCO
-            if result[4] >= 0.15:  # Confidence threshold
-                person_boxes.append(result[:4].cpu().numpy())
-    
-    if not person_boxes:
-        return None, None, 0, None
-    
-    # Extract and resize all person crops
-    person_crops = []
-    for box in person_boxes:
-        x1, y1, x2, y2 = map(int, box)
-        person_crop = frame[y1:y2, x1:x2]
-        person_crop = resize_for_reid(person_crop)  # Resize to standard ReID size
-        person_crops.append(person_crop)
-    
-    # Get embeddings for all crops at once
-    person_embeddings = extractor(person_crops).cpu().numpy()
-    
-    # Find first match that passes threshold
-    for idx, person_embedding in enumerate(person_embeddings):
-        is_match, score = compare_embeddings(person_embedding, target_embeddings)
-        
-        if is_match:  # If this person matches above threshold
-            person_box = person_boxes[idx]
-            x1, y1, x2, y2 = map(int, person_box)
-            person_img = frame[y1:y2, x1:x2]
-            
-            # Find faces that intersect with the person box
-            valid_faces = []
-            for det in frame_face_dets:
-                # Convert face detection to absolute coordinates
-                face_x1, face_y1 = det[0], det[1]
-                face_x2, face_y2 = det[2], det[3]
-                
-                # Check if face intersects with person box
-                if (face_x1 < x2 and face_x2 > x1 and 
-                    face_y1 < y2 and face_y2 > y1):
-                    # Calculate face center y-coordinate relative to person box
-                    face_center_y = (face_y1 + face_y2) / 2 - y1
-                    person_height = y2 - y1
-                    
-                    # Check if face center is in top half of person
-                    if face_center_y < (person_height / 2):
-                        valid_faces.append(det)
-            if valid_faces:
-                # If faces found in top half, select the largest one
-                face_det = max(valid_faces, key=lambda x: (x[2]-x[0]) * (x[3]-x[1]))
-                
-                fx1, fy1, fx2, fy2 = map(int, face_det[:4])
-                
-                face_box = (
-                    fx1,  # Already in absolute coordinates
-                    fy1,
-                    fx2 - fx1,  # Convert to width
-                    fy2 - fy1   # Convert to height
-                )
-                face_img = frame[fy1:fy2, fx1:fx2]
-                return face_box, face_img, score, person_img
-    
-    return None, None, 0, None
-
-def recover_tracking(frame, prev_bbox, dets, debugging=False):
-    """
-    Recovery strategy:
-    1. Use existing face detections from the frame
-    2. Pick the face closest to the previous position
-    """
-    # Get previous bbox center
-    prev_x1, prev_y1, prev_x2, prev_y2 = prev_bbox
-    prev_center_x = (prev_x1 + prev_x2) / 2
-    prev_center_y = (prev_y1 + prev_y2) / 2
-    prev_width = prev_x2 - prev_x1
-    prev_height = prev_y2 - prev_y1
-    
-    # Define search region (1.5x the previous bbox size)
-    search_width = prev_width * 2
-    search_height = prev_height * 2
-    
-    # Calculate search region boundaries
-    search_x1 = prev_center_x - search_width/2
-    search_y1 = prev_center_y - search_height/2
-    search_x2 = search_x1 + search_width
-    search_y2 = search_y1 + search_height
-    
-    best_det = None
-    min_distance = float('inf')
-    
-    for det in dets:
-        # Calculate center of current detection
-        det_center_x = (det[0] + det[2]) / 2
-        det_center_y = (det[1] + det[3]) / 2
-        
-        # Check if detection center is within search region
-        if (search_x1 <= det_center_x <= search_x2 and 
-            search_y1 <= det_center_y <= search_y2):
-            
-            # Calculate distance to previous center
-            distance = np.sqrt(
-                (det_center_x - prev_center_x)**2 + 
-                (det_center_y - prev_center_y)**2
-            )
-            
-            if distance < min_distance:
-                min_distance = distance
-                best_det = (
-                    det[0], det[1],  # x1, y1
-                    det[2] - det[0],  # width
-                    det[3] - det[1]   # height
-                )
-    
-    if debugging and best_det is not None:
-        print(f"Recovery found face at distance: {min_distance:.2f} pixels")
-        
-    return best_det if min_distance < prev_width else None
-
-
-def compare_embeddings(embedding, target_embeddings, threshold=0.7):
-    """Compare person embeddings using average cosine similarity"""
-    if embedding is None or not target_embeddings:
-        return False, 0.0
-    
-    # Calculate similarities for all target embeddings
-    similarities = [1 - cosine(embedding, target_embedding) for target_embedding in target_embeddings]
-    
-    # Use average similarity instead of max
-    avg_similarity = sum(similarities) / len(similarities)
-    max_similarity = max(similarities)
-    return max_similarity > threshold, max_similarity
-
-def detect_scene_change(prev_frame, curr_frame, threshold=0.1):
-    if prev_frame is None or curr_frame is None:
-        return False
-    
-    # Convert frames to grayscale
-    prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_RGB2GRAY)
-    curr_gray = cv2.cvtColor(curr_frame, cv2.COLOR_RGB2GRAY)
-    
-    # Compute histograms
-    prev_hist = cv2.calcHist([prev_gray], [0], None, [256], [0, 256])
-    curr_hist = cv2.calcHist([curr_gray], [0], None, [256], [0, 256])
-    
-    # Normalize histograms
-    prev_hist = cv2.normalize(prev_hist, prev_hist).flatten()
-    curr_hist = cv2.normalize(curr_hist, curr_hist).flatten()
-    
-    # Compare histograms
-    hist_diff = cv2.compareHist(prev_hist, curr_hist, cv2.HISTCMP_BHATTACHARYYA)
-    # print(hist_diff)
-    
-    return hist_diff > threshold
 
 def scale_bb(x1, y1, x2, y2, mask_scale=1.0):
     s = mask_scale - 1.0
@@ -582,7 +238,7 @@ def video_detect(
     # Initialize tracking variables
     face_tracker = None
     frames_without_faces = 0
-    MAX_FRAMES_WITHOUT_FACES = 30
+    MAX_FRAMES_WITHOUT_FACES = 15
     target_person_found = False
     matched_face = None
     match_score = None
@@ -590,7 +246,7 @@ def video_detect(
     flag = True  # For tracking status messages
 
     # Detection confidence thresholds
-    PERSON_CONFIDENCE_THRESHOLD = 0.3
+    # PERSON_CONFIDENCE_THRESHOLD = 0.3
     REID_SIMILARITY_THRESHOLD = 0.5
     SCENE_CHANGE_THRESHOLD = 0.15
 
@@ -600,12 +256,12 @@ def video_detect(
         else:
             current_frame = np.array(frame)
 
-        # Check for scene changes
-        if prev_frame is not None and detect_scene_change(prev_frame, current_frame, SCENE_CHANGE_THRESHOLD):
-            if debugging:
-                print("Scene change detected. Reinitializing person detection and tracking.")
-            face_tracker = None
-            target_person_found = False
+        # # Check for scene changes
+        # if prev_frame is not None and detect_scene_change(prev_frame, current_frame, SCENE_CHANGE_THRESHOLD):
+        #     if debugging:
+        #         print("Scene change detected. Reinitializing person detection and tracking.")
+        #     face_tracker = None
+        #     target_person_found = False
 
         # Get face detections for anonymization
         dets, _ = centerface(current_frame, threshold=threshold)
@@ -660,26 +316,8 @@ def video_detect(
                 flag = True
                 x1, y1, x2, y2 = map(int, tracked_bbox)
                 tracked_box = [x1, y1, x2, y2]
-                
-                # # Find detections that overlap significantly with tracked region
-                # dets_in_tracked = []
-                CONTAINMENT_THRESHOLD = 0.7  # Lower threshold to be more lenient
-                
-                # for det in dets:
-                #     # Extract detection coordinates and ensure they're in the right format
-                #     det_box = [
-                #         int(det[0]),  # x
-                #         int(det[1]),  # y
-                #         int(det[2] - det[0]),  # width
-                #         int(det[3] - det[1])   # height
-                #     ]
-                    
-                #     containment = calculate_containment_ratio(det_box, tracked_box, debugging)
 
-                #     if containment > CONTAINMENT_THRESHOLD:
-                #         dets_in_tracked.append(det)
-                #     elif debugging:
-                #         print(f"Face detection rejected with containment ratio: {containment}")
+                CONTAINMENT_THRESHOLD = 0.7  # Lower threshold to be more lenient
 
                 # Calculate IoU for each detection with the tracked box
                 containments = [calculate_containment_ratio((det[0], det[1], det[2]-det[0], det[3]-det[1]), tracked_bbox, debugging) for det in dets]
@@ -748,51 +386,7 @@ def video_detect(
                                 font, 0.5, (255, 255, 255), 1)
 
                 # If multiple faces detected in tracking region, keep all detections
-                if len(dets_in_tracked) > 1:
-                    if debugging:
-                        print(f"Multiple faces ({len(dets_in_tracked)}) detected in tracking region")
-                    # Don't remove any detections
-                elif len(dets_in_tracked) == 1:
-                    # Update tracking region to center on the single detected face
-                    det = dets_in_tracked[0]
-                    det_center_x = (det[0] + det[2]) / 2  # (x1 + x2) / 2
-                    det_center_y = (det[1] + det[3]) / 2  # (y1 + y2) / 2
-                    
-                    # Calculate current tracking box dimensions
-                    track_width = tracked_bbox[2] - tracked_bbox[0]
-                    track_height = tracked_bbox[3] - tracked_bbox[1]
-                    
-                    # Update tracking box coordinates to center on detection
-                    tracked_bbox = (
-                        det_center_x - track_width / 2,  # new x1
-                        det_center_y - track_height / 2,  # new y1
-                        det_center_x + track_width / 2,  # new x2
-                        det_center_y + track_height / 2   # new y2
-                    )
-                    
-                    # Update tracker with new position
-                    face_tracker = cv2.TrackerCSRT_create()
-                    face_tracker.init(bgr_frame, (
-                        int(tracked_bbox[0]),
-                        int(tracked_bbox[1]),
-                        int(track_width),
-                        int(track_height)
-                    ))
-                    
-                    prev_bbox = tracked_bbox
-                    
-                    # Remove tracked face from detections to avoid double anonymization
-                    dets = [
-                        det for det in dets
-                        if calculate_containment_ratio(
-                            (det[0], det[1], det[2]-det[0], det[3]-det[1]),  # Convert to [x, y, w, h]
-                            tracked_bbox,
-                            debugging
-                        ) < CONTAINMENT_THRESHOLD
-                    ]
-                    
-                else:
-                    # Remove tracked face from detections to avoid double anonymization
+                if len(dets_in_tracked) > 0:
                     dets = [
                         det for det in dets
                         if calculate_containment_ratio(
@@ -804,19 +398,6 @@ def video_detect(
 
                 # Update tracking status
                 if len(dets_in_tracked) == 0:
-                    # Check if tracking box is near frame edges
-                    frame_height, frame_width = current_frame.shape[:2]
-                    edge_threshold = 20  # pixels from edge to consider "near edge"
-                    
-                    is_near_edge = (
-                        tracked_bbox[0] <= edge_threshold or  # Left edge
-                        tracked_bbox[1] <= edge_threshold or  # Top edge
-                        tracked_bbox[2] >= frame_width - edge_threshold or  # Right edge
-                        tracked_bbox[3] >= frame_height - edge_threshold  # Bottom edge
-                    )
-                    # Attempt recovery when not near edge
-                    if debugging:
-                        print("No faces in tracking box, attempting recovery...")
                     recovered_bbox = recover_tracking(current_frame, prev_bbox, dets, debugging)
                     
                     if recovered_bbox is not None:
@@ -828,28 +409,15 @@ def video_detect(
                     
                     frames_without_faces += 1
                     if frames_without_faces >= MAX_FRAMES_WITHOUT_FACES:
-                        if is_near_edge:
-                            if debugging:
-                                print(f"No faces found in tracking region for {MAX_FRAMES_WITHOUT_FACES} frames and tracker near frame edge, resetting tracker")
-                            face_tracker = None
-                            target_person_found = False
-                            frames_without_faces = 0
+                        if debugging:
+                            print(f"No faces found in tracking region for {MAX_FRAMES_WITHOUT_FACES} frames, resetting tracker")
+                        face_tracker = None
+                        target_person_found = False
+                        frames_without_faces = 0
                 else:
                     frames_without_faces = 0
 
                 prev_bbox = tracked_bbox
-            else:
-                if flag and debugging:
-                    flag = False
-                    print("Face tracking lost, attempting to recover...")
-                # Attempt to recover tracking
-                for det in dets:
-                    x1, y1, x2, y2 = map(int, det[:4])
-                    face_image = current_frame[y1:y2, x1:x2]
-                    if is_same_person(face_image, target_embeddings):
-                        face_tracker, prev_bbox = init_face_tracker(bgr_frame, (x1, y1, x2-x1, y2-y1))
-                        dets = [d for d in dets if not np.array_equal(d, det)]
-                        break
 
         # Anonymize remaining faces
         anonymize_frame(
