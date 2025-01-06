@@ -49,7 +49,7 @@ def get_person_embeddings(image_directory, extractor):
     features = extractor(images)
     return list(features.cpu().numpy())
 
-def compare_embeddings(embedding, target_embeddings, threshold=0.7):
+def compare_embeddings(embedding, target_embeddings, threshold=0.75):
     """Compare person embeddings using average cosine similarity"""
     if embedding is None or not target_embeddings:
         return False, 0.0
@@ -64,7 +64,7 @@ def find_person_in_frame(frame, target_embeddings, threshold, person_detector, e
     person_boxes = []
     
     for result in results.boxes.data:
-        if result[5] == 0 and result[4] >= 0.15:  # Class 0 is person
+        if result[5] == 0 and result[4] >= 0.3:  # Class 0 is person
             person_boxes.append(result[:4].cpu().numpy())
     
     if not person_boxes:
@@ -79,29 +79,47 @@ def find_person_in_frame(frame, target_embeddings, threshold, person_detector, e
     
     person_embeddings = extractor(person_crops).cpu().numpy()
     
+    # Track best match across all persons
+    best_match = {
+        'score': 0,
+        'person_box': None,
+        'face_box': None,
+        'face_img': None,
+        'person_img': None
+    }
+    
     for idx, person_embedding in enumerate(person_embeddings):
         is_match, score = compare_embeddings(person_embedding, target_embeddings)
         
-        if is_match:
+        if is_match and score > best_match['score']:
             person_box = person_boxes[idx]
             x1, y1, x2, y2 = map(int, person_box)
             person_img = frame[y1:y2, x1:x2]
+            person_area = (x2 - x1) * (y2 - y1)
             
             valid_faces = []
             for det in frame_face_dets:
                 # Convert face detection to absolute coordinates
                 face_x1, face_y1 = det[0], det[1]
                 face_x2, face_y2 = det[2], det[3]
+                face_area = (face_x2 - face_x1) * (face_y2 - face_y1)
                 
-                # Check if face intersects with person box
-                if (face_x1 < x2 and face_x2 > x1 and 
-                    face_y1 < y2 and face_y2 > y1):
-                    # Calculate face center y-coordinate relative to person box
+                # Calculate intersection area
+                intersection_x1 = max(x1, face_x1)
+                intersection_y1 = max(y1, face_y1)
+                intersection_x2 = min(x2, face_x2)
+                intersection_y2 = min(y2, face_y2)
+                
+                if intersection_x2 > intersection_x1 and intersection_y2 > intersection_y1:
+                    intersection_area = (intersection_x2 - intersection_x1) * (intersection_y2 - intersection_y1)
+                    containment_ratio = intersection_area / face_area
+                    
+                    # Check containment ratio and vertical position
                     face_center_y = (face_y1 + face_y2) / 2 - y1
                     person_height = y2 - y1
                     
-                    # Check if face center is in top half of person
-                    if face_center_y < (person_height / 3):
+                    if (containment_ratio >= 0.9 and  # 90% containment threshold
+                        face_center_y < (person_height / 2.5)):  # Top third of person
                         valid_faces.append(det)
             
             if valid_faces:
@@ -109,6 +127,18 @@ def find_person_in_frame(frame, target_embeddings, threshold, person_detector, e
                 fx1, fy1, fx2, fy2 = map(int, face_det[:4])
                 face_box = (fx1, fy1, fx2 - fx1, fy2 - fy1)
                 face_img = frame[fy1:fy2, fx1:fx2]
-                return face_box, face_img, score, person_img
+                
+                best_match.update({
+                    'score': score,
+                    'person_box': face_box,
+                    'face_img': face_img,
+                    'person_img': person_img
+                })
     
-    return None, None, 0, None
+    if best_match['score'] > 0:
+        return (best_match['person_box'], 
+                best_match['face_img'], 
+                best_match['score'], 
+                best_match['person_img'])
+    
+    return None, None, 0, None    

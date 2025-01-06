@@ -37,23 +37,7 @@ from recognition import (
 
 # Global variables
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-person_detector = YOLO('yolov8n.pt')
 face_tracker = None
-
-def init_reid_model():
-    """Initialize FastReID model with ResNet50-IBN backbone"""
-    cfg = get_cfg()
-    # cfg.merge_from_file("/home/manavgoyalid2/configs/Market1501/")
-    cfg.MODEL.BACKBONE.PRETRAIN = False
-    cfg.MODEL.WEIGHTS = "/home/manavgoyalid2/models/market_bot_R50-ibn.pth"  # Download pretrained weights
-    cfg.MODEL.DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-    # print(cfg.MODEL.DEVICE)
-    
-    model = build_model(cfg)
-    Checkpointer(model).load(cfg.MODEL.WEIGHTS)
-    model.to(DEVICE).eval()
-    
-    return model, cfg
 
 def calculate_containment_ratio(det_box, tracking_box, debugging=False):
     """Calculate how much of the detection box is contained within the tracking box"""
@@ -267,7 +251,7 @@ def video_detect(
         dets, _ = centerface(current_frame, threshold=threshold)
 
         # Update the person detection section
-        if not target_person_found or face_tracker is None:
+        if (not target_person_found or face_tracker is None) and len(dets) > 0:
             person_bbox, face_img, score, person_img = find_person_in_frame(
                 current_frame, 
                 target_embeddings,
@@ -637,10 +621,10 @@ def main():
 
     # Initialize models
     print("Initializing models...")
-    person_detector = YOLO('yolov8n.pt')
+    person_detector = YOLO('yolo11x.pt')
     extractor = FeatureExtractor(
         model_name='osnet_x1_0',
-        model_path='/home/manavgoyalid2/models/osnet_ms_d_c.pth.tar',
+        model_path='./models/osnet_ms_d_c.pth.tar',
         device='cuda' if torch.cuda.is_available() else 'cpu'
     )
     centerface = CenterFace(in_shape=in_shape, backend=backend, override_execution_provider=execution_provider)
