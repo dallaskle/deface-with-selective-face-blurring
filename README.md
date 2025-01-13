@@ -32,6 +32,8 @@ python deface/main.py /path/to/input_directory \
 - `input_dir`: Directory containing video folders
 - `--video-filename`: Name of video files (default: `video.mp4`)
 - `--target-person-dirname`: Name of target person directory (default: `target_person`)
+- `--thresh`: Face detection threshold (tune this to trade off between false positive and false negative rate) (default: `0.4`)
+- `--disable-tracker-reset`: Disable automatic face tracker reset. Use this if the target subject never leaves the frame.
 - `--debugging`: Enable debug visualization and console output
 - `--keep-audio`: Preserve original audio in output video
 

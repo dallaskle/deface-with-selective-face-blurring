@@ -58,13 +58,13 @@ def compare_embeddings(embedding, target_embeddings, threshold=0.75):
     max_similarity = max(similarities)
     return max_similarity > threshold, max_similarity
 
-def find_person_in_frame(frame, target_embeddings, threshold, person_detector, extractor, frame_face_dets):
+def find_person_in_frame(frame, target_embeddings, threshold, person_detection_results, extractor, frame_face_dets):
     """Find target person and their face in frame"""
-    results = person_detector(frame, verbose=False)[0]
+    results = person_detection_results
     person_boxes = []
     
     for result in results.boxes.data:
-        if result[5] == 0 and result[4] >= 0.3:  # Class 0 is person
+        if result[5] == 0 and result[4] >= 0.15:  # Class 0 is person
             person_boxes.append(result[:4].cpu().numpy())
     
     if not person_boxes:
@@ -114,12 +114,13 @@ def find_person_in_frame(frame, target_embeddings, threshold, person_detector, e
                     intersection_area = (intersection_x2 - intersection_x1) * (intersection_y2 - intersection_y1)
                     containment_ratio = intersection_area / face_area
                     
-                    # Check containment ratio and vertical position
-                    face_center_y = (face_y1 + face_y2) / 2 - y1
-                    person_height = y2 - y1
+                    # Check face position relative to person top using face height
+                    face_height = face_y2 - face_y1
+                    face_top = face_y1  # Changed from using face center to face top
+                    person_top = y1
                     
                     if (containment_ratio >= 0.9 and  # 90% containment threshold
-                        face_center_y < (person_height / 2.5)):  # Top third of person
+                        abs(face_top - person_top) <= face_height):  # Compare face top to person top
                         valid_faces.append(det)
             
             if valid_faces:

@@ -37,7 +37,6 @@ from recognition import (
 
 # Global variables
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-face_tracker = None
 
 def calculate_containment_ratio(det_box, tracking_box, debugging=False):
     """Calculate how much of the detection box is contained within the tracking box"""
@@ -63,6 +62,84 @@ def calculate_containment_ratio(det_box, tracking_box, debugging=False):
     
     ratio = intersection_area / det_area if det_area > 0 else 0
     return ratio
+
+def boxes_intersect(box1, box2):
+    """Check if two bounding boxes intersect at all"""
+    # Convert box1 from [x, y, w, h] to [x1, y1, x2, y2] if needed
+    if len(box1) == 4:
+        x1_1, y1_1 = box1[0], box1[1]
+        x2_1, y2_1 = (x1_1 + box1[2], y1_1 + box1[3]) if len(box1) == 4 else (box1[2], box1[3])
+    
+    # Box2 is expected to be in [x1, y1, x2, y2] format
+    x1_2, y1_2, x2_2, y2_2 = box2
+    
+    # Check if boxes intersect
+    return not (x2_1 < x1_2 or x1_1 > x2_2 or y2_1 < y1_2 or y1_1 > y2_2)
+
+def add_debugging_overlay(
+    current_frame,
+    dets_in_tracked,
+    tracked_bbox,
+    matched_face,
+    matched_person,
+    match_score
+):
+    """Add debugging visualization overlays to the frame"""
+    x1, y1, x2, y2 = map(int, tracked_bbox)
+    
+    # Draw tracking box
+    cv2.rectangle(current_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+    
+    # Add face count overlay
+    text = f"Faces in tracked region: {len(dets_in_tracked)}"
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.7
+    thickness = 2
+    (text_width, text_height), _ = cv2.getTextSize(text, font, font_scale, thickness)
+    
+    # Draw background rectangle
+    cv2.rectangle(current_frame, (10, 10), (text_width + 20, text_height + 20), (0, 0, 0), -1)
+    cv2.putText(current_frame, text, (15, text_height + 15), font, font_scale, (0, 255, 0), thickness)
+    
+    # Add matched face preview
+    if matched_face is not None and matched_person is not None:
+        # Display matched person
+        person_display_size = (150, 300)
+        matched_person_resized = cv2.resize(matched_person, person_display_size)
+        
+        # Display matched face
+        face_display_size = (100, 100)
+        matched_face_resized = cv2.resize(matched_face, face_display_size)
+        
+        # Calculate positions
+        y_offset = 10
+        x_offset = current_frame.shape[1] - person_display_size[0] - 10
+        
+        # Add matched person
+        current_frame[y_offset:y_offset+person_display_size[1], 
+            x_offset:x_offset+person_display_size[0]] = matched_person_resized
+        
+        # Add matched face below person
+        face_y_offset = y_offset + person_display_size[1] + 10
+        face_x_offset = x_offset + (person_display_size[0] - face_display_size[0]) // 2
+        current_frame[face_y_offset:face_y_offset+face_display_size[1],
+            face_x_offset:face_x_offset+face_display_size[0]] = matched_face_resized
+        
+        # Add confidence score
+        score_text = f"Person Score: {match_score:.3f}"
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        text_size = cv2.getTextSize(score_text, font, 0.5, 1)[0]
+        text_x = x_offset + (person_display_size[0] - text_size[0]) // 2
+        text_y = face_y_offset + face_display_size[1] + 20
+        
+        cv2.rectangle(current_frame, 
+                    (text_x - 5, text_y - text_size[1] - 5),
+                    (text_x + text_size[0] + 5, text_y + 5),
+                    (0, 0, 0), -1)
+        cv2.putText(current_frame, score_text, (text_x, text_y),
+                font, 0.5, (255, 255, 255), 1)
+
+    return current_frame
 
 def scale_bb(x1, y1, x2, y2, mask_scale=1.0):
     s = mask_scale - 1.0
@@ -166,8 +243,9 @@ def video_detect(
         debugging: bool = False,
         person_detector = None,
         reid_model = None,
-        debug_start: float = None,  # New parameter with default None
-        debug_duration: float = None,  # New parameter with default None
+        debug_start: float = None,
+        debug_duration: float = None,
+        disable_tracker_reset: bool = False,
 ):
     try:
         # Initialize reader based on debug parameters
@@ -247,16 +325,96 @@ def video_detect(
         #     face_tracker = None
         #     target_person_found = False
 
+        # # Get face detections using YOLOv8 instead of CenterFace
+        # results = face_detector(current_frame, verbose=False)[0]
+        # dets = []
+        # for result in results.boxes.data:
+        #     if result[4] >= threshold:  # Check confidence threshold
+        #         x1, y1, x2, y2 = map(int, result[:4])
+        #         confidence = float(result[4])
+        #         # Convert to format expected by rest of code: [x1, y1, x2, y2, confidence]
+        #         dets.append(np.array([x1, y1, x2, y2, confidence]))
+
+        #         # # Add debugging visualization for all face detections
+        #         # if debugging:
+        #         #     # Draw red rectangle for face detections
+        #         #     cv2.rectangle(current_frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
+        #         #     # Add confidence score
+        #         #     cv2.putText(
+        #         #         current_frame,
+        #         #         f'Face: {confidence:.2f}',
+        #         #         (x1, y1 - 5),
+        #         #         cv2.FONT_HERSHEY_SIMPLEX,
+        #         #         0.5,
+        #         #         (255, 0, 0),
+        #         #         2
+        #         #     )
+                    
+        # dets = np.array(dets)
+
+        # if debugging:
+        #     # Add face count overlays
+        #     texts = [
+        #         f"Total faces detected: {len(dets)}"
+        #     ]
+            
+        #     font = cv2.FONT_HERSHEY_SIMPLEX
+        #     font_scale = 0.7
+        #     thickness = 2
+        #     y_offset = 10
+            
+        #     for text in texts:
+        #         (text_width, text_height), _ = cv2.getTextSize(text, font, font_scale, thickness)
+        #         # Draw background rectangle
+        #         cv2.rectangle(current_frame, 
+        #                     (10, y_offset), 
+        #                     (text_width + 20, y_offset + text_height + 10), 
+        #                     (0, 0, 0), 
+        #                     -1)
+        #         # Draw text
+        #         cv2.putText(current_frame, 
+        #                 text, 
+        #                 (15, y_offset + text_height + 5), 
+        #                 font, 
+        #                 font_scale, 
+        #                 (0, 255, 0), 
+        #                 thickness)
+        #         y_offset += text_height + 20
+
         # Get face detections for anonymization
         dets, _ = centerface(current_frame, threshold=threshold)
+        
+        # Run person detection once per frame when needed
+        person_detection_results = None
+
+        # debugging person detection bbox
+
+        # person_detection_results = person_detector(current_frame, verbose=False)[0]
+        # for result in person_detection_results.boxes.data:
+        #     if result[5] == 0 and result[4] >= 0.1:  # Class 0 is person with confidence > 0.3
+        #         x1, y1, x2, y2 = map(int, result[:4])
+        #         confidence = result[4]
+        #         # Draw blue rectangle for person detections
+        #         cv2.rectangle(current_frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
+        #         # Add confidence score
+        #         cv2.putText(
+        #             current_frame,
+        #             f'Person: {confidence:.2f}',
+        #             (x1, y1 - 5),
+        #             cv2.FONT_HERSHEY_SIMPLEX,
+        #             0.5,
+        #             (255, 0, 0),
+        #             2
+        #         )
 
         # Update the person detection section
         if (not target_person_found or face_tracker is None) and len(dets) > 0:
+            person_detection_results = person_detector(current_frame, verbose=False)[0]
             person_bbox, face_img, score, person_img = find_person_in_frame(
                 current_frame, 
                 target_embeddings,
                 REID_SIMILARITY_THRESHOLD,
-                person_detector,
+                person_detection_results,
                 reid_model,
                 dets  # Pass the face detections here
             )
@@ -317,71 +475,62 @@ def video_detect(
 
                 # Add debugging overlays
                 if debugging:
-                    # Draw tracking box
-                    cv2.rectangle(current_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                    
-                    # Add face count overlay
-                    text = f"Faces in tracked region: {len(dets_in_tracked)}"
-                    font = cv2.FONT_HERSHEY_SIMPLEX
-                    font_scale = 0.7
-                    thickness = 2
-                    (text_width, text_height), _ = cv2.getTextSize(text, font, font_scale, thickness)
-                    
-                    # Draw background rectangle
-                    cv2.rectangle(current_frame, (10, 10), (text_width + 20, text_height + 20), (0, 0, 0), -1)
-                    cv2.putText(current_frame, text, (15, text_height + 15), font, font_scale, (0, 255, 0), thickness)
-                    
-                    # Add matched face preview
-                    if matched_face is not None and matched_person is not None:
-                        # Display matched person
-                        person_display_size = (150, 300)  # Adjust size as needed
-                        matched_person_resized = cv2.resize(matched_person, person_display_size)
-                        
-                        # Display matched face
-                        face_display_size = (100, 100)
-                        matched_face_resized = cv2.resize(matched_face, face_display_size)
-                        
-                        # Calculate positions
-                        y_offset = 10
-                        x_offset = current_frame.shape[1] - person_display_size[0] - 10
-                        
-                        # Add matched person
-                        current_frame[y_offset:y_offset+person_display_size[1], 
-                            x_offset:x_offset+person_display_size[0]] = matched_person_resized
-                        
-                        # Add matched face below person
-                        face_y_offset = y_offset + person_display_size[1] + 10
-                        face_x_offset = x_offset + (person_display_size[0] - face_display_size[0]) // 2
-                        current_frame[face_y_offset:face_y_offset+face_display_size[1],
-                            face_x_offset:face_x_offset+face_display_size[0]] = matched_face_resized
-                        
-                        # Add confidence score
-                        score_text = f"Score: {match_score:.3f}"
-                        font = cv2.FONT_HERSHEY_SIMPLEX
-                        text_size = cv2.getTextSize(score_text, font, 0.5, 1)[0]
-                        text_x = x_offset + (person_display_size[0] - text_size[0]) // 2
-                        text_y = face_y_offset + face_display_size[1] + 20
-                        
-                        cv2.rectangle(current_frame, 
-                                    (text_x - 5, text_y - text_size[1] - 5),
-                                    (text_x + text_size[0] + 5, text_y + 5),
-                                    (0, 0, 0), -1)
-                        cv2.putText(current_frame, score_text, (text_x, text_y),
-                                font, 0.5, (255, 255, 255), 1)
+                    current_frame = add_debugging_overlay(
+                        current_frame,
+                        dets_in_tracked,
+                        tracked_bbox,
+                        matched_face,
+                        matched_person,
+                        match_score
+                    )
 
-                # If multiple faces detected in tracking region, keep all detections
-                if len(dets_in_tracked) > 0:
+                if len(dets_in_tracked) == 1:
+                    # Single face detected - keep existing logic
                     dets = [
                         det for det in dets
                         if calculate_containment_ratio(
-                            (det[0], det[1], det[2]-det[0], det[3]-det[1]),  # Convert to [x, y, w, h]
+                            (det[0], det[1], det[2]-det[0], det[3]-det[1]),
                             tracked_bbox,
                             debugging
                         ) < CONTAINMENT_THRESHOLD
                     ]
+                    frames_without_faces = 0
+                    
+                elif len(dets_in_tracked) > 1:
+                    # Multiple faces detected - check person detections
+                    if person_detection_results is None:
+                        person_detection_results = person_detector(current_frame, verbose=False)[0]
+                    
+                    person_boxes = []
+                    # Get person detections with confidence > 0.3
+                    for result in person_detection_results.boxes.data:
+                        if result[5] == 0 and result[4] >= 0.3:  # Class 0 is person
+                            person_boxes.append(result[:4].cpu().numpy())
+                    
+                    # Count persons intersecting with tracking box
+                    intersecting_persons = sum(
+                        1 for person_box in person_boxes 
+                        if boxes_intersect(person_box, tracked_bbox)
+                    )
+                    
+                    if debugging:
+                        print(f"Found {intersecting_persons} persons intersecting with tracking box")
+                    
+                    # If multiple persons detected, keep all face detections for anonymization
+                    if intersecting_persons <= 1:
+                        dets = [
+                            det for det in dets
+                            if calculate_containment_ratio(
+                                (det[0], det[1], det[2]-det[0], det[3]-det[1]),
+                                tracked_bbox,
+                                debugging
+                            ) < CONTAINMENT_THRESHOLD
+                        ]
+                    frames_without_faces = 0
+                    # else: keep all detections for anonymization
 
-                # Update tracking status
-                if len(dets_in_tracked) == 0:
+                # if no face detection in tracking region
+                else:
                     recovered_bbox = recover_tracking(current_frame, prev_bbox, dets, debugging)
                     
                     if recovered_bbox is not None:
@@ -392,14 +541,12 @@ def video_detect(
                             print("Tracking recovered successfully")
                     
                     frames_without_faces += 1
-                    if frames_without_faces >= MAX_FRAMES_WITHOUT_FACES:
+                    if not disable_tracker_reset and frames_without_faces >= MAX_FRAMES_WITHOUT_FACES:
                         if debugging:
                             print(f"No faces found in tracking region for {MAX_FRAMES_WITHOUT_FACES} frames, resetting tracker")
                         face_tracker = None
                         target_person_found = False
                         frames_without_faces = 0
-                else:
-                    frames_without_faces = 0
 
                 prev_bbox = tracked_bbox
 
@@ -532,9 +679,13 @@ def parse_cli_args():
         '--debugging', default=False, action='store_true',
         help='Enable debug mode with additional console output and visualization.'
     )
+    parser.add_argument(
+        '--disable-tracker-reset', default=False, action='store_true',
+        help='Disable automatic tracker reset when faces are not found. Use this if the target subject never leaves the frame.'
+    )
 
     parser.add_argument(
-        '--thresh', '-t', default=0.3, type=float, metavar='T',
+        '--thresh', '-t', default=0.4, type=float, metavar='T',
         help='Detection threshold (tune this to trade off between false positive and false negative rate). Default: 0.2.')
     parser.add_argument(
         '--scale', '-s', default=None, metavar='WxH',
@@ -549,7 +700,7 @@ def parse_cli_args():
         '--draw-scores', default=False, action='store_true',
         help='Draw detection scores onto outputs.')
     parser.add_argument(
-        '--mask-scale', default=1.5, type=float, metavar='M',
+        '--mask-scale', default=1.3, type=float, metavar='M',
         help='Scale factor for face masks, to make sure that masks cover the complete face. Default: 1.3.')
     parser.add_argument(
         '--replacewith', default='blur', choices=['blur', 'solid', 'none', 'img', 'mosaic'],
@@ -622,6 +773,7 @@ def main():
     # Initialize models
     print("Initializing models...")
     person_detector = YOLO('yolo11x.pt')
+    # face_detector = YOLO('face_yolov9c.pt')
     extractor = FeatureExtractor(
         model_name='osnet_x1_0',
         model_path='./models/osnet_ms_d_c.pth.tar',
@@ -675,6 +827,7 @@ def main():
             print(f'Output path: {output_path}')
             
             # Process the video
+            # Process the video
             video_detect(
                 ipath=video_path,
                 opath=output_path,
@@ -693,8 +846,9 @@ def main():
                 mosaicsize=mosaicsize,
                 target_embeddings=target_embeddings,
                 debugging=args.debugging,
-                person_detector=person_detector,  # Add these new parameters
+                person_detector=person_detector,
                 reid_model=extractor,
+                disable_tracker_reset=args.disable_tracker_reset,
             )
             
             print(f"Successfully processed {video_folder}")
