@@ -246,9 +246,21 @@ def video_detect(
         debug_start: float = None,
         debug_duration: float = None,
         disable_tracker_reset: bool = False,
+        reid_threshold: float = 0.7,
+        max_frames_without_faces: int = 30,
 ):
+    """Process a video file or camera stream, detecting and anonymizing faces while tracking a target person.
+    
+    The function performs the following main tasks:
+    1. Initializes video reader and writer
+    2. Processes each frame to detect faces and persons
+    3. Tracks the target person if found
+    4. Anonymizes non-target faces
+    5. Handles debug visualization if enabled
+    """
+
+    # Initialize video reader with debug parameters if specified
     try:
-        # Initialize reader based on debug parameters
         if debug_start is not None:
             if debugging:
                 print(f"Starting video processing from {debug_start} seconds")
@@ -262,14 +274,10 @@ def video_detect(
             
             reader = imageio.get_reader(ipath, size=None, fps=None, input_params=input_params)
         else:
-            if 'fps' in ffmpeg_config:
-                reader = imageio.get_reader(ipath, fps=ffmpeg_config['fps'])
-            else:
-                reader = imageio.get_reader(ipath)
+            reader = imageio.get_reader(ipath, fps=ffmpeg_config.get('fps', None))
 
-        # Rest of the existing video_detect function remains the same
         meta = reader.get_meta_data()
-        _ = meta['size']
+        _ = meta['size']  # Validate metadata
     except:
         if cam:
             print(f'Could not find video device {ipath}. Please set a valid input.')
@@ -277,6 +285,7 @@ def video_detect(
             print(f'Could not open file {ipath} as a video file with imageio. Skipping file...')
         return
 
+    # Set up video reader iterator and progress bar
     if cam:
         nframes = None
         read_iter = cam_read_iter(reader)
@@ -284,11 +293,9 @@ def video_detect(
         read_iter = reader.iter_data()
         nframes = reader.count_frames()
 
-    if nested:
-        bar = tqdm.tqdm(dynamic_ncols=True, total=nframes, position=1, leave=True)
-    else:
-        bar = tqdm.tqdm(dynamic_ncols=True, total=nframes)
+    bar = tqdm.tqdm(dynamic_ncols=True, total=nframes, position=1 if nested else 0, leave=True)
 
+    # Initialize video writer if output path specified
     if opath is not None:
         _ffmpeg_config = ffmpeg_config.copy()
         _ffmpeg_config.setdefault('fps', meta['fps'])
@@ -297,128 +304,43 @@ def video_detect(
             _ffmpeg_config.setdefault('audio_codec', 'copy')
         writer = imageio.get_writer(opath, format='FFMPEG', mode='I', **_ffmpeg_config)
 
-    # Initialize tracking variables
-    face_tracker = None
-    frames_without_faces = 0
-    MAX_FRAMES_WITHOUT_FACES = 15
-    target_person_found = False
-    matched_face = None
-    match_score = None
-    prev_frame = None
+    # Initialize tracking state variables
+    face_tracker = None  # Active tracker for target person
+    frames_without_faces = 0  # Counter for frames where target face is lost
+    target_person_found = False  # Whether target person has been identified
+    matched_face = None  # Last matched face image for debugging
+    match_score = None  # Last ReID confidence score
+    prev_frame = None  # Previous frame for tracking recovery
     flag = True  # For tracking status messages
 
-    # Detection confidence thresholds
-    # PERSON_CONFIDENCE_THRESHOLD = 0.3
-    REID_SIMILARITY_THRESHOLD = 0.5
-    SCENE_CHANGE_THRESHOLD = 0.15
+    # Detection thresholds
+    REID_SIMILARITY_THRESHOLD = reid_threshold  # Minimum similarity score for person ReID
+    MAX_FRAMES_WITHOUT_FACES = max_frames_without_faces  # Max frames to continue tracking without detection
 
     for frame in read_iter:
-        if isinstance(frame, np.ndarray):
-            current_frame = frame
-        else:
-            current_frame = np.array(frame)
+        # Convert frame to numpy array if needed
+        current_frame = np.array(frame) if not isinstance(frame, np.ndarray) else frame
 
-        # # Check for scene changes
-        # if prev_frame is not None and detect_scene_change(prev_frame, current_frame, SCENE_CHANGE_THRESHOLD):
-        #     if debugging:
-        #         print("Scene change detected. Reinitializing person detection and tracking.")
-        #     face_tracker = None
-        #     target_person_found = False
-
-        # # Get face detections using YOLOv8 instead of CenterFace
-        # results = face_detector(current_frame, verbose=False)[0]
-        # dets = []
-        # for result in results.boxes.data:
-        #     if result[4] >= threshold:  # Check confidence threshold
-        #         x1, y1, x2, y2 = map(int, result[:4])
-        #         confidence = float(result[4])
-        #         # Convert to format expected by rest of code: [x1, y1, x2, y2, confidence]
-        #         dets.append(np.array([x1, y1, x2, y2, confidence]))
-
-        #         # # Add debugging visualization for all face detections
-        #         # if debugging:
-        #         #     # Draw red rectangle for face detections
-        #         #     cv2.rectangle(current_frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
-        #         #     # Add confidence score
-        #         #     cv2.putText(
-        #         #         current_frame,
-        #         #         f'Face: {confidence:.2f}',
-        #         #         (x1, y1 - 5),
-        #         #         cv2.FONT_HERSHEY_SIMPLEX,
-        #         #         0.5,
-        #         #         (255, 0, 0),
-        #         #         2
-        #         #     )
-                    
-        # dets = np.array(dets)
-
-        # if debugging:
-        #     # Add face count overlays
-        #     texts = [
-        #         f"Total faces detected: {len(dets)}"
-        #     ]
-            
-        #     font = cv2.FONT_HERSHEY_SIMPLEX
-        #     font_scale = 0.7
-        #     thickness = 2
-        #     y_offset = 10
-            
-        #     for text in texts:
-        #         (text_width, text_height), _ = cv2.getTextSize(text, font, font_scale, thickness)
-        #         # Draw background rectangle
-        #         cv2.rectangle(current_frame, 
-        #                     (10, y_offset), 
-        #                     (text_width + 20, y_offset + text_height + 10), 
-        #                     (0, 0, 0), 
-        #                     -1)
-        #         # Draw text
-        #         cv2.putText(current_frame, 
-        #                 text, 
-        #                 (15, y_offset + text_height + 5), 
-        #                 font, 
-        #                 font_scale, 
-        #                 (0, 255, 0), 
-        #                 thickness)
-        #         y_offset += text_height + 20
-
-        # Get face detections for anonymization
+        # Step 1: Face Detection
         dets, _ = centerface(current_frame, threshold=threshold)
-        
-        # Run person detection once per frame when needed
         person_detection_results = None
 
-        # debugging person detection bbox
-
-        # person_detection_results = person_detector(current_frame, verbose=False)[0]
-        # for result in person_detection_results.boxes.data:
-        #     if result[5] == 0 and result[4] >= 0.1:  # Class 0 is person with confidence > 0.3
-        #         x1, y1, x2, y2 = map(int, result[:4])
-        #         confidence = result[4]
-        #         # Draw blue rectangle for person detections
-        #         cv2.rectangle(current_frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
-        #         # Add confidence score
-        #         cv2.putText(
-        #             current_frame,
-        #             f'Person: {confidence:.2f}',
-        #             (x1, y1 - 5),
-        #             cv2.FONT_HERSHEY_SIMPLEX,
-        #             0.5,
-        #             (255, 0, 0),
-        #             2
-        #         )
-
-        # Update the person detection section
+        # Step 2: Target Person Detection & Tracking Initialization
         if (not target_person_found or face_tracker is None) and len(dets) > 0:
+            # Only run person detection when needed
             person_detection_results = person_detector(current_frame, verbose=False)[0]
+            
+            # Try to find target person in frame
             person_bbox, face_img, score, person_img = find_person_in_frame(
                 current_frame, 
                 target_embeddings,
                 REID_SIMILARITY_THRESHOLD,
                 person_detection_results,
                 reid_model,
-                dets  # Pass the face detections here
+                dets
             )
             
+            # Initialize tracking if target found
             if person_bbox is not None:
                 face_tracker, prev_bbox = init_face_tracker(
                     cv2.cvtColor(current_frame, cv2.COLOR_RGB2BGR), 
@@ -426,12 +348,12 @@ def video_detect(
                 )
                 target_person_found = True
                 matched_face = face_img
-                matched_person = person_img  # Store the person image
+                matched_person = person_img
                 match_score = score
                 if debugging:
                     print(f"Target person found with confidence: {score:.3f}")
 
-        # Update face tracking if active
+        # Step 3: Update Face Tracking
         if face_tracker is not None:
             bgr_frame = cv2.cvtColor(current_frame, cv2.COLOR_RGB2BGR)
             tracked_bbox = update_face_tracker(bgr_frame, face_tracker, prev_bbox)
@@ -459,7 +381,7 @@ def video_detect(
                 x1, y1, x2, y2 = map(int, tracked_bbox)
                 tracked_box = [x1, y1, x2, y2]
 
-                CONTAINMENT_THRESHOLD = 0.7  # Lower threshold to be more lenient
+                CONTAINMENT_THRESHOLD = 0.5  # Lower threshold to be more lenient
 
                 # Calculate IoU for each detection with the tracked box
                 containments = [calculate_containment_ratio((det[0], det[1], det[2]-det[0], det[3]-det[1]), tracked_bbox, debugging) for det in dets]
@@ -534,11 +456,29 @@ def video_detect(
                     recovered_bbox = recover_tracking(current_frame, prev_bbox, dets, debugging)
                     
                     if recovered_bbox is not None:
-                        # Reinitialize tracker with recovered detection
+                        # Convert recovered_bbox to the format expected by face_tracker
+                        bgr_frame = cv2.cvtColor(current_frame, cv2.COLOR_RGB2BGR)
+                        # Create new tracker instance and initialize it
+                        face_tracker = None  # Clear old tracker
                         face_tracker, prev_bbox = init_face_tracker(bgr_frame, recovered_bbox)
+                        tracked_bbox = prev_bbox  # Update tracked_bbox for current frame
                         frames_without_faces = 0
+                        
+                        # Remove the recovered detection from dets to avoid double processing
+                        recovered_det = None
+                        for det in dets:
+                            det_box = [det[0], det[1], det[2]-det[0], det[3]-det[1]]  # Convert to [x, y, w, h]
+                            if calculate_containment_ratio(det_box, recovered_bbox, debugging) > 0.5:
+                                recovered_det = det
+                                break
+                        
+                        if recovered_det is not None:
+                            dets = np.array([det for det in dets if not np.array_equal(det, recovered_det)])
+                            
                         if debugging:
                             print("Tracking recovered successfully")
+                            if recovered_det is not None:
+                                print("Recovered detection excluded from anonymization")
                     
                     frames_without_faces += 1
                     if not disable_tracker_reset and frames_without_faces >= MAX_FRAMES_WITHOUT_FACES:
@@ -550,13 +490,14 @@ def video_detect(
 
                 prev_bbox = tracked_bbox
 
-        # Anonymize remaining faces
+        # Step 4: Anonymize Non-Target Faces
         anonymize_frame(
             dets, current_frame, mask_scale=mask_scale,
             replacewith=replacewith, ellipse=ellipse, draw_scores=draw_scores,
             replaceimg=replaceimg, mosaicsize=mosaicsize,
         )
 
+        # Step 5: Write/Display Output
         if opath is not None:
             writer.append_data(current_frame)
 
@@ -683,10 +624,26 @@ def parse_cli_args():
         '--disable-tracker-reset', default=False, action='store_true',
         help='Disable automatic tracker reset when faces are not found. Use this if the target subject never leaves the frame.'
     )
-
+    parser.add_argument(
+        '--debug-start', type=float, default=None,
+        help='Start time in seconds for processing a specific segment'
+    )
+    parser.add_argument(
+        '--debug-duration', type=float, default=None,
+        help='Duration in seconds for processing a specific segment'
+    )
+    parser.add_argument(
+        '--reid-threshold', default=0.7, type=float,
+        help='Similarity threshold for target person re-identification. Higher values are more strict. Default: 0.7'
+    )
+    parser.add_argument(
+        '--max-frames-without-faces', default=30, type=int,
+        help='Maximum number of frames to continue tracking when no faces are detected before resetting. Default: 30'
+    )
     parser.add_argument(
         '--thresh', '-t', default=0.4, type=float, metavar='T',
-        help='Detection threshold (tune this to trade off between false positive and false negative rate). Default: 0.2.')
+        help='Detection threshold for face blurring (tune this to trade off between false positive and false negative rate). Default: 0.2.')
+    
     parser.add_argument(
         '--scale', '-s', default=None, metavar='WxH',
         help='Downscale images for network inference to this size (format: WxH, example: --scale 640x360).')
@@ -763,6 +720,9 @@ def main():
     execution_provider = args.execution_provider
     mosaicsize = args.mosaicsize
     keep_metadata = args.keep_metadata
+    debug_start = args.debug_start
+    debug_duration = args.debug_duration
+
     replaceimg = None
     if in_shape is not None:
         w, h = in_shape.split('x')
@@ -827,7 +787,6 @@ def main():
             print(f'Output path: {output_path}')
             
             # Process the video
-            # Process the video
             video_detect(
                 ipath=video_path,
                 opath=output_path,
@@ -849,6 +808,10 @@ def main():
                 person_detector=person_detector,
                 reid_model=extractor,
                 disable_tracker_reset=args.disable_tracker_reset,
+                debug_start=args.debug_start,
+                debug_duration=args.debug_duration,
+                reid_threshold=args.reid_threshold,  # Add new argument
+                max_frames_without_faces=args.max_frames_without_faces,  # Add new argument
             )
             
             print(f"Successfully processed {video_folder}")

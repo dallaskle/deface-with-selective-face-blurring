@@ -49,7 +49,7 @@ def get_person_embeddings(image_directory, extractor):
     features = extractor(images)
     return list(features.cpu().numpy())
 
-def compare_embeddings(embedding, target_embeddings, threshold=0.75):
+def compare_embeddings(embedding, target_embeddings, threshold=0.70):
     """Compare person embeddings using average cosine similarity"""
     if embedding is None or not target_embeddings:
         return False, 0.0
@@ -89,7 +89,7 @@ def find_person_in_frame(frame, target_embeddings, threshold, person_detection_r
     }
     
     for idx, person_embedding in enumerate(person_embeddings):
-        is_match, score = compare_embeddings(person_embedding, target_embeddings)
+        is_match, score = compare_embeddings(person_embedding, target_embeddings, threshold)
         
         if is_match and score > best_match['score']:
             person_box = person_boxes[idx]
