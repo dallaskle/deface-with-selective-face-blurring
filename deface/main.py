@@ -19,10 +19,10 @@ from ultralytics import YOLO
 from PIL import Image
 
 # Deep learning models and configs
-from fastreid.config import get_cfg
-from fastreid.modeling.meta_arch import build_model
-from fastreid.utils.checkpoint import Checkpointer
-from reid.torchreid.utils import FeatureExtractor
+# from torchreid.fastreid.config import get_cfg  # Commented out
+# from torchreid.fastreid.modeling.meta_arch import build_model  # Commented out
+# from torchreid.fastreid.utils.checkpoint import Checkpointer  # Commented out
+from torchreid.reid.utils import FeatureExtractor
 
 # Local imports
 from deface import __version__

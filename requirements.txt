@@ -6,8 +6,11 @@ scikit-image
 tqdm
 deepface
 onnx
-onnxruntime-gpu
+onnxruntime
 shapely
 tf-keras
-tensorflow=2.14.0
-tensorrt
+tensorflow-macos
+ultralytics
+torchreid
+torch==2.3.0
+torchvision==0.18.0
